@@ -3,3 +3,5 @@ dist/
 .env
 data/*.db
 coverage/
+# Local AI runtime state
+.atl/

@@ -6,6 +6,8 @@ Last updated: 2026-07-24
 
 ## Sources scanned
 
+- .claude\skills
+- .agents\skills
 - C:\Users\loren\.pi\agent\skills
 - C:\Users\loren\.config\agents\skills
 - C:\Users\loren\.agents\skills
@@ -38,6 +40,8 @@ Last updated: 2026-07-24
 | `judgment-day` | Trigger: judgment day, dual review, adversarial review, juzgar. Run explicit blind dual review with at most two scoped fix/re-judgment rounds. | user | `C:\Users\loren\.config\opencode\skills\judgment-day\SKILL.md` |
 | `skill-creator` | Trigger: new skills, agent instructions, documenting AI usage patterns. Create LLM-first skills with valid frontmatter. | user | `C:\Users\loren\.config\opencode\skills\skill-creator\SKILL.md` |
 | `skill-improver` | Trigger: improve skills, audit skills, refactor skills, skill quality. Audit and upgrade existing LLM-first skills. | user | `C:\Users\loren\.config\opencode\skills\skill-improver\SKILL.md` |
+| `supabase` | Use when doing ANY task involving Supabase. Triggers: Supabase products (Database, Auth, Edge Functions, Realtime, Storage, Vectors, Cron, Queues); client libraries and SSR integrations (supabase-js, @supabase/ssr) in Next.js, React, SvelteKit, Astro, Remix; auth issues (login, logout, sessions, JWT, cookies, getSession, getUser, getClaims, RLS); Supabase CLI or MCP server; schema changes, migrations, declarative schemas, security audits, Postgres extensions (pg_graphql, pg_cron, pg_vector). | project | `C:\Juan\Proyectos\WORK\Js\Scraping\.claude\skills\supabase\SKILL.md` |
+| `supabase-postgres-best-practices` | Postgres performance optimization and best practices from Supabase. Use this skill when writing, reviewing, or optimizing Postgres queries, schema designs, or database configurations. | project | `C:\Juan\Proyectos\WORK\Js\Scraping\.claude\skills\supabase-postgres-best-practices\SKILL.md` |
 | `work-unit-commits` | Plan commits as reviewable work units. Trigger: implementation, commit splitting, chained PRs, or keeping tests and docs with code. | user | `C:\Users\loren\.config\opencode\skills\work-unit-commits\SKILL.md` |
 
 ## Loading protocol

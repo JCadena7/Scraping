@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { loadConfig } from './config.js';
 import { JerHistoryParser } from './history-parser.js';
 import { JerHttpClient } from './http-client.js';

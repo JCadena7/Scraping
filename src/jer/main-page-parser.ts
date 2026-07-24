@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio';
 import type { AnyNode } from 'domhandler';
-import { DiscoveredGame, GameType, JerHtmlStructureChangedError, LatestParse, NormalizedDrawResult, RejectedRow, normalizeSign, normalizeText } from './domain.js';
-import { sourceHash } from './hash.js';
+import { DiscoveredGame, GameType, JerHtmlStructureChangedError, LatestParse, NormalizedDrawResult, RejectedRow, normalizeSign, normalizeText, validateNormalizedResult } from './domain.js';
+import { canonicalResultHash } from './hash.js';
 
 const slugOf = (url: string) => new URL(url).pathname.split('/').filter(Boolean).at(-1) ?? '';
 const codeOf = (url: string, name: string) => (slugOf(url) || name).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
@@ -40,7 +40,8 @@ export class JerMainPageParser {
           if (!/^\d+$/.test(winningNumber)) throw new Error(`invalid winning number: ${winningNumber}`);
           const drawDate = parseDate(findByHeader(headers, values, 'fecha'));
           const fifth = findByHeader(headers, values, 'quinta'); const series = findByHeader(headers, values, 'serie'); const sign = findByHeader(headers, values, 'signo');
-          results.push({ gameCode: game.code, gameName: game.name, gameType: game.type, drawDate, winningNumber, fifthDigit: fifth ? fifth.replace(/\D/g, '') || null : null, series: series || null, zodiacSign: sign ? normalizeSign(sign) : null, sourceUrl: detailUrl, fetchedAt, sourceHash: sourceHash(html), verified: true });
+           const result = validateNormalizedResult({ gameCode: game.code, gameName: game.name, gameType: game.type, drawDate, winningNumber, fifthDigit: fifth ? fifth.replace(/\D/g, '') || null : null, series: series || null, zodiacSign: sign ? normalizeSign(sign) : null, sourceUrl: detailUrl, fetchedAt, sourceHash: '', verified: true });
+           results.push({ ...result, sourceHash: canonicalResultHash(result) });
         } catch (error) { rejected.push({ row: tableIndex * 10000 + rowIndex + 1, reason: error instanceof Error ? error.message : String(error) }); }
       });
     });

@@ -36,6 +36,15 @@ export class JerResultNotFoundError extends JerError { constructor(message: stri
 export class JerDateMismatchError extends JerError { constructor(expected: string, actual: string) { super(`Requested date ${expected}, response date ${actual}`, 'JER_DATE_MISMATCH'); this.name = 'JerDateMismatchError'; } }
 export class JerInvalidResultError extends JerError { constructor(message: string) { super(message, 'JER_INVALID_RESULT'); this.name = 'JerInvalidResultError'; } }
 
+const acceptedGameTypes = new Set<GameType>(['LOTTERY', 'CHANCE', 'ASTRO', 'DUPLA']);
+
+export function validateNormalizedResult<T extends Pick<NormalizedDrawResult, 'gameType' | 'winningNumber' | 'fifthDigit'>>(result: T): T {
+  if (!acceptedGameTypes.has(result.gameType)) throw new JerInvalidResultError(`Unsupported game type: ${result.gameType}`);
+  if (!/^\d{4}$/.test(result.winningNumber)) throw new JerInvalidResultError(`Winning number must contain exactly four digits: ${result.winningNumber}`);
+  if (result.fifthDigit !== null && result.fifthDigit !== undefined && !/^\d$/.test(result.fifthDigit)) throw new JerInvalidResultError(`Fifth digit must contain exactly one digit: ${result.fifthDigit}`);
+  return result;
+}
+
 export function assertDate(value: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new JerInvalidResultError(`Invalid date: ${value}`);
   const date = new Date(`${value}T12:00:00-05:00`);

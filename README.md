@@ -1,16 +1,25 @@
 # JER Results Scraper
 
-Módulo Node.js para descubrir, normalizar y almacenar resultados publicados por JER SuRed. El sitio entrega HTML renderizado en servidor, por lo que el scraper usa `fetch` y `cheerio`; no necesita Playwright, Puppeteer ni Selenium.
+This Node.js scraper discovers, normalizes, and stores JER SuRed draw results in Supabase/PostgreSQL. It fetches server-rendered HTML with `fetch` and Cheerio; it does not use SQLite, browser automation, Playwright, Puppeteer, or Selenium.
 
-## Arquitectura
+## Quick path
 
-`src/jer/http-client.ts` aplica timeout, `AbortSignal`, User-Agent, una cola por dominio, intervalo entre solicitudes, reintentos de errores transitorios y respeto de `Retry-After`. `main-page-parser.ts` interpreta las tablas por encabezados y descubre los enlaces históricos. `history-parser.ts` procesa el formulario y los POST históricos con validaciones de fecha y número. `use-cases.ts` coordina descubrimiento, sincronización reciente y backfill. `repository.ts` crea las tablas SQLite, hace UPSERT idempotente y registra cambios de contenido.
+1. Apply the draw-results migration, then `supabase/migrations/202607240001_harden_jer_persistence.sql`.
+2. Configure a server-only Supabase service-role key.
+3. Discover the catalog before running a filtered backfill.
 
-La persistencia usa Supabase/PostgreSQL. La migración `supabase/migrations/202607230001_draw_results.sql` crea `draw_games`, `draw_results`, `draw_result_changes` y `draw_ingestion_runs`. Las fechas se envían como `YYYY-MM-DD`, evitando conversiones UTC accidentales para `America/Bogota`.
+```bash
+pnpm install
+pnpm scrape:jer:discover
+pnpm scrape:jer:latest
+pnpm scrape:jer:backfill --game=CHONTICO_DIA
+pnpm scrape:jer:backfill --games=CHONTICO_DIA,RESULTADOS_SORTEO_ANTIOQUENITA_DIA
+pnpm scrape:jer:backfill --game=CHONTICO_DIA --from=2024-01-01 --to=2026-07-23
+```
 
-## Configuración
+Game codes are generated from JER result-page URL slugs, not maintained as a fixed list. The fixture catalog demonstrates `CHONTICO_DIA`, `RESULTADOS_SORTEO_ANTIOQUENITA_DIA`, `ASTRO_SOL`, and `DUPLA`; use `pnpm scrape:jer:discover` to print the current production codes before filtering.
 
-Variables disponibles:
+## Configuration and security
 
 ```env
 JER_RESULTS_BASE_URL=https://jer.com.co
@@ -24,21 +33,28 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-server-only-key
 ```
 
-## Comandos
+`SUPABASE_SERVICE_ROLE_KEY` is required and must never be exposed to browsers or committed. The hardening migration enables RLS on the scraper tables, denies anonymous and authenticated access, and grants the `upsert_draw_result` RPC only to `service_role`. The repository persists results through that RPC; direct public-client writes are not supported.
 
-```bash
-pnpm install
-pnpm scrape:jer:discover
-pnpm scrape:jer:latest
-pnpm scrape:jer:backfill --game=CHONTICO_DIA
-pnpm scrape:jer:backfill --game=CHONTICO_DIA --from=2024-01-01 --to=2026-07-23
-pnpm scrape:jer:backfill --games=CHONTICO_DIA,CHONTICO_NOCHE
-```
+Apply migrations in order: first `202607230001_draw_results.sql`, then `202607240001_harden_jer_persistence.sql`. Deploy application code that requires the service-role key only after the security migration is live.
 
-El backfill consulta el catálogo y la página individual una sola vez por juego, omite fechas existentes y guarda cada POST inmediatamente. Si se detiene, se reanuda ejecutando el mismo comando. Los errores se incluyen en el resumen y dejan la ejecución como `PARTIAL`; no se paralelizan fechas.
+## CLI behavior
 
-## Parsers y mantenimiento
+| Exit code | Status | Meaning |
+|---|---|---|
+| `0` | `SUCCESS` | All requested work completed. |
+| `1` | `FAILED` | Invalid command, configuration, filter, cancellation, or complete failure. |
+| `2` | `PARTIAL` | At least one requested operation failed while another completed. |
 
-El catálogo no contiene una lista fija: se obtiene de `a.botonres_vmas` y de enlaces bajo `/resultados/`, usando el slug como código estable. La clasificación distingue loterías, chances, Astro y Dupla mediante slug/nombre. Para agregar una estructura nueva, primero añade una estrategia validada en `JerHistoryParser`, sus fixtures y una prueba; ante HTML desconocido se lanza un error y no se inserta el resultado.
+For `backfill`, `--game=CODE` and `--games=A,B` are validated against the persisted JER catalog before any JER request. Unknown codes fail with exit `1`; a filtered run also fails clearly when the persisted catalog is empty, so it cannot silently succeed with zero games. Run `discover` first to create or refresh that catalog.
 
-El HTML externo puede cambiar sin aviso. Revisá `draw_ingestion_runs` y el resumen de la CLI para detectar filas rechazadas, fechas no procesadas o cambios de `sourceHash`. Los cambios de un resultado existente se guardan en `draw_result_changes` antes de actualizar el registro actual. El rate limiting predeterminado es deliberadamente conservador: una solicitud simultánea por dominio y cinco segundos entre solicitudes.
+Backfill reads a game's available dates, skips dates already persisted, and saves each result immediately. Re-run the same command after interruption to resume; existing dates remain skipped.
+
+## Networking and cancellation
+
+Requests are serialized per domain, use a conservative configured delay, retry transient failures, and honor `Retry-After`. An `AbortSignal` is checked before queue admission, while waiting, after delay/backoff, and before fetch. A cancelled request does not fetch and releases its queue gate so later same-domain work continues. Cancellation is a failed CLI outcome, never a silent success.
+
+## Parsing and hashes
+
+The parser uses bounded, game-specific historical result containers. It accepts LOTTERY, CHANCE, ASTRO, and DUPLA results only when the winning number has exactly four digits; unknown layouts/types fail closed and are not persisted. To support another JER layout, add a bounded parser strategy, frozen fixtures, and red-green-refactor tests before enabling it.
+
+Each normalized result has a deterministic `v2:` SHA-256 hash built from stable normalized fields and source URL fragments. It intentionally excludes mutable whole-page HTML and timestamps. Legacy hashes can be re-baselined once by the RPC; later v2 changes are retained in the audit trail.

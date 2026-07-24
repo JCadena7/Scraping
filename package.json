@@ -1,0 +1,32 @@
+{
+  "name": "jer-results-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape:jer:latest": "tsx src/jer/cli.ts latest",
+    "scrape:jer:discover": "tsx src/jer/cli.ts discover",
+    "scrape:jer:backfill": "tsx src/jer/cli.ts backfill",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src test --max-warnings=0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "@supabase/supabase-js": "^2.47.10",
+    "domhandler": "^5.0.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@typescript-eslint/eslint-plugin": "^8.19.1",
+    "@typescript-eslint/parser": "^8.19.1",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "packageManager": "pnpm@9.15.4"
+}

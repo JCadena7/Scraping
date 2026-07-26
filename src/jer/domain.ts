@@ -1,5 +1,11 @@
 export type GameType = 'LOTTERY' | 'CHANCE' | 'ASTRO' | 'DUPLA' | 'OTHER';
-export type IngestionStatus = 'RUNNING' | 'SUCCESS' | 'PARTIAL' | 'FAILED';
+export type SourceState = 'ACTIVE' | 'RATE_LIMITED' | 'BLOCKED' | 'DISABLED';
+export type IngestionStatus = 'RUNNING' | 'PAUSED' | 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'BLOCKED' | 'CANCELLED' | 'RATE_LIMITED';
+export type CliOutcome = Extract<IngestionStatus, 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'BLOCKED' | 'RATE_LIMITED' | 'CANCELLED'>;
+
+export function cliExitCode(status: CliOutcome): number {
+  return { SUCCESS: 0, FAILED: 1, PARTIAL: 2, BLOCKED: 3, RATE_LIMITED: 4, CANCELLED: 130 }[status];
+}
 
 export interface DiscoveredGame {
   code: string;
@@ -30,11 +36,21 @@ export interface LatestParse { results: NormalizedDrawResult[]; rejected: Reject
 
 export class JerError extends Error { constructor(message: string, public readonly code: string) { super(message); this.name = 'JerError'; } }
 export class JerHttpError extends JerError { constructor(message: string, public readonly status: number, public readonly url: string) { super(message, 'JER_HTTP_ERROR'); this.name = 'JerHttpError'; } }
+export class JerBlockedError extends JerHttpError { constructor(message: string, status: number, url: string) { super(message, status, url); this.name = 'JerBlockedError'; } }
 export class JerRateLimitError extends JerHttpError { constructor(message: string, status: number, url: string, public readonly retryAfterMs?: number) { super(message, status, url); this.name = 'JerRateLimitError'; } }
 export class JerHtmlStructureChangedError extends JerError { constructor(message: string) { super(message, 'JER_HTML_STRUCTURE_CHANGED'); this.name = 'JerHtmlStructureChangedError'; } }
 export class JerResultNotFoundError extends JerError { constructor(message: string) { super(message, 'JER_RESULT_NOT_FOUND'); this.name = 'JerResultNotFoundError'; } }
 export class JerDateMismatchError extends JerError { constructor(expected: string, actual: string) { super(`Requested date ${expected}, response date ${actual}`, 'JER_DATE_MISMATCH'); this.name = 'JerDateMismatchError'; } }
 export class JerInvalidResultError extends JerError { constructor(message: string) { super(message, 'JER_INVALID_RESULT'); this.name = 'JerInvalidResultError'; } }
+
+const acceptedGameTypes = new Set<GameType>(['LOTTERY', 'CHANCE', 'ASTRO', 'DUPLA']);
+
+export function validateNormalizedResult<T extends Pick<NormalizedDrawResult, 'gameType' | 'winningNumber' | 'fifthDigit'>>(result: T): T {
+  if (!acceptedGameTypes.has(result.gameType)) throw new JerInvalidResultError(`Unsupported game type: ${result.gameType}`);
+  if (!/^\d{4}$/.test(result.winningNumber)) throw new JerInvalidResultError(`Winning number must contain exactly four digits: ${result.winningNumber}`);
+  if (result.fifthDigit !== null && result.fifthDigit !== undefined && !/^\d$/.test(result.fifthDigit)) throw new JerInvalidResultError(`Fifth digit must contain exactly one digit: ${result.fifthDigit}`);
+  return result;
+}
 
 export function assertDate(value: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new JerInvalidResultError(`Invalid date: ${value}`);

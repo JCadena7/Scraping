@@ -56,7 +56,8 @@ create table if not exists public.draw_ingestion_runs (
 create index if not exists draw_results_game_date_idx on public.draw_results(game_id, draw_date);
 
 create or replace function public.set_draw_updated_at()
-returns trigger language plpgsql as $$
+returns trigger language plpgsql
+set search_path = pg_catalog, public as $$
 begin
   new.updated_at = now();
   return new;

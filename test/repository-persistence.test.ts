@@ -33,6 +33,33 @@ function clientWithStoredDrawNumber(drawNumber?: string) {
 }
 
 describe('secure result persistence', () => {
+  it('maps every operational RPC from its PostgREST one-row array response', async () => {
+    const rpc = vi.fn()
+      .mockResolvedValueOnce({ data: [{ acquired: true, state: 'ACTIVE', cooldown_until: null, lease_expires_at: null, version: 1 }], error: null })
+      .mockResolvedValueOnce({ data: [{ renewed: true }], error: null })
+      .mockResolvedValueOnce({ data: [{ released: true }], error: null })
+      .mockResolvedValueOnce({ data: [{ accepted: true, duplicate: false, version: 2 }], error: null })
+      .mockResolvedValueOnce({ data: [{ transitioned: true, blocked_until: '2026-07-25T00:00:00.000Z' }], error: null })
+      .mockResolvedValueOnce({ data: [{ transitioned: true, cooldown_until: '2026-07-25T00:00:00.000Z' }], error: null });
+    const repository = new DrawRepository({ rpc } as never);
+    const owner = '00000000-0000-0000-0000-000000000001';
+    await expect(repository.acquireJerLease(owner, 60000)).resolves.toMatchObject({ acquired: true });
+    await expect(repository.renewJerLease(owner, 60000)).resolves.toBe(true);
+    await expect(repository.releaseJerLease(owner)).resolves.toBe(true);
+    await expect(repository.saveJerProgress('run', { ownerToken: owner, version: 2, requestToken: owner, attempted: 1, inserted: 1, updated: 0, skipped: 0, failed: 0, status: 'RUNNING' })).resolves.toMatchObject({ accepted: true });
+    await expect(repository.transitionJer403(owner, 'run', 21_600_000, 'forbidden')).resolves.toBe(true);
+    await expect(repository.transitionJer429(owner, 'run', 3_600_000, 'limited')).resolves.toBe(true);
+    expect(rpc).toHaveBeenCalledWith('jer_renew_lease', { p_owner_token: owner, p_lease_duration_ms: 60000 });
+    expect(rpc).toHaveBeenCalledWith('jer_release_lease', { p_owner_token: owner });
+  });
+  it('maps singleton RPC row arrays and rejects malformed acquire responses', async () => {
+    const rpc = vi.fn(async () => ({ data: [{ acquired: true, state: 'ACTIVE', owner_token: '00000000-0000-0000-0000-000000000001', lease_expires_at: '2026-07-24T00:01:00.000Z', version: 1 }], error: null }));
+    const repository = new DrawRepository({ rpc } as never);
+
+    await expect(repository.acquireJerLease('00000000-0000-0000-0000-000000000001', 60000)).resolves.toMatchObject({ acquired: true, state: 'ACTIVE' });
+    await expect(repository.acquireJerLease('00000000-0000-0000-0000-000000000001', 60000)).resolves.not.toBeInstanceOf(Array);
+  });
+
   it.each([
     ['inserted', 'inserted'],
     ['skipped', 'skipped'],

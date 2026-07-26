@@ -2,8 +2,11 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { DiscoveredGame, IngestionStatus, NormalizedDrawResult } from './domain.js';
 import { canonicalResultHash } from './hash.js';
 
+export interface JerProgressWrite { ownerToken: string; version: number; requestToken: string; attempted: number; inserted: number; updated: number; skipped: number; failed: number; status: string; nextPendingDate?: string; }
+
 export interface UpsertCounts { inserted: number; updated: number; skipped: number; }
-export interface RunSummary { id: string; status: IngestionStatus; gamesQueried: number; datesQueried: number; resultsFound: number; resultsInserted: number; resultsUpdated: number; resultsSkipped: number; errors: string[]; }
+export interface RunSummary { id: string; status: IngestionStatus; sourceState?: 'ACTIVE' | 'RATE_LIMITED' | 'BLOCKED' | 'DISABLED'; gamesQueried: number; datesQueried: number; resultsFound: number; resultsInserted: number; resultsUpdated: number; resultsSkipped: number; errors: string[]; }
+export interface JerLeaseResult { acquired: boolean; state: 'ACTIVE' | 'RATE_LIMITED' | 'BLOCKED' | 'DISABLED'; cooldownUntil?: string | null; leaseExpiresAt?: string | null; version: number; }
 type GameRow = { id: string; external_code: string; name: string; type: DiscoveredGame['type']; detail_url: string; active: boolean };
 
 export class DrawRepository {
@@ -31,6 +34,40 @@ export class DrawRepository {
     if (!['inserted', 'updated', 'skipped', 'rebaselined'].includes(action)) throw new Error(`Could not persist result ${result.gameCode}/${result.drawDate}: invalid RPC action`);
     return action === 'rebaselined' ? 'skipped' : action;
   }
+  async acquireJerLease(ownerToken: string, leaseDurationMs: number): Promise<JerLeaseResult> {
+    const { data, error } = await this.client.rpc('jer_acquire_and_gate', { p_owner_token: ownerToken, p_lease_duration_ms: leaseDurationMs });
+    if (error) throw new Error(`Could not acquire JER lease: ${error.message}`);
+    const row = Array.isArray(data) && data.length === 1 ? data[0] : undefined;
+    if (!row || typeof row.acquired !== 'boolean' || !['ACTIVE', 'RATE_LIMITED', 'BLOCKED', 'DISABLED'].includes(row.state as string) || typeof row.version !== 'number') throw new Error('Could not acquire JER lease: invalid RPC response');
+    return { acquired: row.acquired, state: row.state as JerLeaseResult['state'], cooldownUntil: row.cooldown_until as string | null | undefined, leaseExpiresAt: row.lease_expires_at as string | null | undefined, version: row.version };
+  }
+  async renewJerLease(ownerToken: string, leaseDurationMs: number): Promise<boolean> {
+    const { data, error } = await this.client.rpc('jer_renew_lease', { p_owner_token: ownerToken, p_lease_duration_ms: leaseDurationMs });
+    if (error) throw new Error(`Could not renew JER lease: ${error.message}`);
+    if (!Array.isArray(data) || data.length !== 1 || typeof data[0]?.renewed !== 'boolean') throw new Error('Could not renew JER lease: invalid RPC response');
+    return data[0].renewed;
+  }
+  async releaseJerLease(ownerToken: string): Promise<boolean> {
+    const { data, error } = await this.client.rpc('jer_release_lease', { p_owner_token: ownerToken });
+    if (error) throw new Error(`Could not release JER lease: ${error.message}`);
+    if (!Array.isArray(data) || data.length !== 1 || typeof data[0]?.released !== 'boolean') throw new Error('Could not release JER lease: invalid RPC response');
+    return data[0].released;
+  }
+  async saveJerProgress(runId: string, write: JerProgressWrite): Promise<{ accepted: boolean; duplicate: boolean; version: number }> {
+    const { data, error } = await this.client.rpc('jer_save_progress', { p_run_id: runId, p_owner_token: write.ownerToken, p_version: write.version, p_request_token: write.requestToken, p_status: write.status, p_attempted: write.attempted, p_inserted: write.inserted, p_updated: write.updated, p_skipped: write.skipped, p_failed: write.failed, p_next_pending_date: write.nextPendingDate ?? null });
+    if (error) throw new Error(`Could not save JER progress: ${error.message}`);
+    const row = Array.isArray(data) && data.length === 1 ? data[0] : undefined;
+    if (!row || typeof row.accepted !== 'boolean' || typeof row.duplicate !== 'boolean' || typeof row.version !== 'number') throw new Error('Could not save JER progress: invalid RPC response');
+    return row;
+  }
+  async transitionJer403(ownerToken: string, runId: string | undefined, cooldownMs: number, errorText: string): Promise<boolean> { return this.transitionJer('jer_transition_403', ownerToken, runId, cooldownMs, errorText); }
+  async transitionJer429(ownerToken: string, runId: string | undefined, cooldownMs: number, errorText: string): Promise<boolean> { return this.transitionJer('jer_transition_429', ownerToken, runId, cooldownMs, errorText); }
+  private async transitionJer(rpcName: 'jer_transition_403' | 'jer_transition_429', ownerToken: string, runId: string | undefined, cooldownMs: number, errorText: string): Promise<boolean> {
+    const { data, error } = await this.client.rpc(rpcName, { p_owner_token: ownerToken, p_run_id: runId ?? null, p_cooldown_ms: cooldownMs, p_error: errorText });
+    if (error) throw new Error(`Could not transition JER source: ${error.message}`);
+    if (!Array.isArray(data) || data.length !== 1 || typeof data[0]?.transitioned !== 'boolean') throw new Error('Could not transition JER source: invalid RPC response');
+    return data[0].transitioned;
+  }
   private async enrichDrawNumber(result: NormalizedDrawResult): Promise<NormalizedDrawResult> {
     if (result.drawNumber != null) return result;
     const game = await this.getGame(result.gameCode);
@@ -41,6 +78,6 @@ export class DrawRepository {
     const drawNumber = data.draw_number as string;
     return { ...result, drawNumber, sourceHash: canonicalResultHash({ ...result, drawNumber }) };
   }
-  async startRun(runType: string): Promise<string> { const { data, error } = await this.client.from('draw_ingestion_runs').insert({ run_type: runType, status: 'RUNNING' }).select('id').single(); if (error) throw new Error(`Could not start ingestion run: ${error.message}`); return data.id as string; }
+  async startRun(runType: string, ownerToken?: string): Promise<string> { const { data, error } = await this.client.from('draw_ingestion_runs').insert({ run_type: runType, status: 'RUNNING', ...(ownerToken ? { owner_token: ownerToken } : {}) }).select('id').single(); if (error) throw new Error(`Could not start ingestion run: ${error.message}`); return data.id as string; }
   async finishRun(id: string, summary: Omit<RunSummary, 'id' | 'status'>, status: IngestionStatus): Promise<void> { const { error } = await this.client.from('draw_ingestion_runs').update({ finished_at: new Date().toISOString(), status, games_queried: summary.gamesQueried, dates_queried: summary.datesQueried, results_found: summary.resultsFound, results_inserted: summary.resultsInserted, results_updated: summary.resultsUpdated, results_skipped: summary.resultsSkipped, errors: summary.errors }).eq('id', id); if (error) throw new Error(`Could not finish ingestion run: ${error.message}`); }
 }

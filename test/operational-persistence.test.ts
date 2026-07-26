@@ -9,7 +9,7 @@ describe('JER operational persistence migration', () => {
     expect(existsSync(migrationPath)).toBe(true);
     const migration = readFileSync(migrationPath, 'utf8');
 
-    expect(migration).toMatch(/create table public\.scraping_source_states/i);
+    expect(migration).toMatch(/create table if not exists public\.scraping_source_states/i);
     expect(migration).toMatch(/check \(source_code = 'JER' and source_host = 'jer\.com\.co'\)/i);
     expect(migration).toMatch(/owner_token uuid/i);
     expect(migration).toMatch(/lease_expires_at timestamptz/i);

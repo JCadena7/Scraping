@@ -1,6 +1,6 @@
 -- Additive operational controls for the single JER source. Database time and row locks
 -- make this safe across independently running scraper processes.
-create table public.scraping_source_states (
+create table if not exists public.scraping_source_states (
   source_code text primary key,
   source_host text not null,
   state text not null default 'ACTIVE' check (state in ('ACTIVE','RATE_LIMITED','BLOCKED','DISABLED')),
@@ -38,6 +38,7 @@ alter table public.draw_ingestion_runs
   add column if not exists owner_token uuid,
   add column if not exists version bigint not null default 0 check (version >= 0),
   add column if not exists request_token uuid;
+alter table public.draw_ingestion_runs drop constraint if exists draw_ingestion_runs_source_code_check;
 alter table public.draw_ingestion_runs add constraint draw_ingestion_runs_source_code_check check (source_code = 'JER') not valid;
 alter table public.draw_ingestion_runs validate constraint draw_ingestion_runs_source_code_check;
 

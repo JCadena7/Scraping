@@ -116,6 +116,8 @@ begin
 end;
 $$;
 
+drop trigger if exists preserve_jer_draw_number on public.draw_results;
+
 create trigger preserve_jer_draw_number
 before update on public.draw_results
 for each row execute function public.preserve_jer_draw_number();

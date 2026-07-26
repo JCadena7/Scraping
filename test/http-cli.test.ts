@@ -6,6 +6,10 @@ import { JerHttpClient } from '../src/jer/http-client.js';
 import { persistOperationalFailure, runCli, parseArgs, parseOperationalOverrides, runWithSignals } from '../src/jer/cli.js';
 import { BackfillJerResultsUseCase, SyncJerLatestResultsUseCase } from '../src/jer/use-cases.js';
 
+function cliDependencies() {
+  return { latest: vi.fn(async (): Promise<{ status: string; sourceState?: string }> => ({ status: 'SUCCESS' })), backfill: vi.fn(async (): Promise<{ status: string; sourceState?: string }> => ({ status: 'SUCCESS' })), discover: vi.fn(async () => ({ status: 'SUCCESS' })), print: vi.fn(), error: vi.fn() };
+}
+
 const options = (fetchImpl: typeof fetch, delayMs = 0) => ({ timeoutMs: 1_000, delayMs, maxRetries: 1, userAgent: 'test', fetchImpl });
 const game = { code: 'CHONTICO_DIA', name: 'Chontico Día', type: 'CHANCE' as const, detailUrl: 'https://jer.example/resultados/chontico-dia/', active: true };
 
@@ -75,6 +79,57 @@ describe('JerHttpClient cancellation', () => {
 });
 
 describe('CLI filters and status', () => {
+  it('starts and stops an observer only for exact valueless latest and backfill flags', async () => {
+    const observer = { start: vi.fn(), stop: vi.fn() };
+    const dependencies = { ...cliDependencies(), memoryObserverFactory: vi.fn(() => observer) };
+
+    await expect(runCli(['latest', '--measure-memory'], dependencies)).resolves.toBe(0);
+    await expect(runCli(['backfill', '--game=CHONTICO_DIA', '--measure-memory'], dependencies)).resolves.toBe(0);
+    await expect(runCli(['latest', '--measure-memory=yes'], dependencies)).resolves.toBe(0);
+    await expect(runCli(['discover', '--measure-memory'], dependencies)).resolves.toBe(0);
+    await expect(runCli(['latest'], dependencies)).resolves.toBe(0);
+
+    expect(dependencies.memoryObserverFactory).toHaveBeenCalledTimes(2);
+    expect(observer.start).toHaveBeenCalledTimes(2);
+    expect(observer.stop).toHaveBeenCalledTimes(2);
+    expect(dependencies.backfill).toHaveBeenCalledWith(expect.objectContaining({ games: ['CHONTICO_DIA'] }));
+  });
+
+  it('excludes measure-memory from backfill override validation and isolates observer failures', async () => {
+    const dependencies = { ...cliDependencies(), memoryObserverFactory: vi.fn(() => ({ start: () => { throw new Error('start'); }, stop: () => { throw new Error('stop'); } })) };
+
+    await expect(runCli(['backfill', '--measure-memory', '--batch-size=2'], dependencies)).resolves.toBe(0);
+    await expect(runCli(['backfill', '--measure-memory=unexpected'], dependencies)).resolves.toBe(0);
+    expect(() => parseOperationalOverrides({ 'measure-memory': '' })).toThrow('Unknown JER operational override: measure-memory');
+    expect(dependencies.backfill).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves failed, blocked, cancelled, and thrown command outcomes when telemetry is enabled', async () => {
+    const observer = { start: vi.fn(), stop: vi.fn(() => { throw new Error('stop'); }) };
+    const dependencies = { ...cliDependencies(), memoryObserverFactory: vi.fn(() => observer) };
+    dependencies.latest.mockResolvedValueOnce({ status: 'BLOCKED' }).mockResolvedValueOnce({ status: 'CANCELLED' }).mockRejectedValueOnce(new Error('original'));
+
+    await expect(runCli(['latest', '--measure-memory'], dependencies)).resolves.toBe(3);
+    await expect(runCli(['latest', '--measure-memory'], dependencies)).resolves.toBe(130);
+    await expect(runCli(['latest', '--measure-memory'], dependencies)).rejects.toThrow('original');
+    expect(observer.stop).toHaveBeenCalledTimes(3);
+  });
+
+  it('preserves PAUSED and lease-failure exits when observer factory, start, or stop fails', async () => {
+    const factoryFailure = { ...cliDependencies(), memoryObserverFactory: vi.fn(() => { throw new Error('factory'); }) };
+    factoryFailure.latest.mockResolvedValueOnce({ status: 'PAUSED' });
+    await expect(runCli(['latest', '--measure-memory'], factoryFailure)).resolves.toBe(0);
+    expect(factoryFailure.latest).toHaveBeenCalledTimes(1);
+
+    const observer = { start: vi.fn(() => { throw new Error('start'); }), stop: vi.fn(() => { throw new Error('stop'); }) };
+    const leaseFailure = { ...cliDependencies(), memoryObserverFactory: vi.fn(() => observer) };
+    leaseFailure.latest.mockResolvedValueOnce({ status: 'FAILED', sourceState: 'ACTIVE' });
+    await expect(runCli(['latest', '--measure-memory'], leaseFailure)).resolves.toBe(1);
+    expect(observer.start).toHaveBeenCalledTimes(1);
+    expect(observer.stop).toHaveBeenCalledTimes(1);
+    expect(leaseFailure.latest).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['discover', new JerBlockedError('blocked', 403, 'https://jer.example'), 3, 'transitionJer403'],
     ['discover', new JerRateLimitError('limited', 429, 'https://jer.example', 7_200_000), 4, 'transitionJer429'],
@@ -137,6 +192,17 @@ describe('CLI filters and status', () => {
 
     await expect(running).resolves.toBe(130);
     expect(signal.aborted).toBe(true);
+    expect(processLike.removeListener).toHaveBeenCalledWith('SIGINT', expect.any(Function));
+    expect(processLike.removeListener).toHaveBeenCalledWith('SIGTERM', expect.any(Function));
+  });
+
+  it('maps SIGTERM to exit 130 and removes both signal handlers after finalization', async () => {
+    const handlers = new Map<string, () => void>();
+    const processLike = { on: vi.fn((event: string, handler: () => void) => { handlers.set(event, handler); }), removeListener: vi.fn((event: string) => { handlers.delete(event); }) };
+    const running = runWithSignals(async () => { handlers.get('SIGTERM')?.(); return 0; }, processLike);
+
+    await expect(running).resolves.toBe(130);
+    expect(handlers.size).toBe(0);
     expect(processLike.removeListener).toHaveBeenCalledWith('SIGINT', expect.any(Function));
     expect(processLike.removeListener).toHaveBeenCalledWith('SIGTERM', expect.any(Function));
   });
@@ -223,6 +289,15 @@ describe('CLI filters and status', () => {
     expect(readme).toContain('| `1` | `FAILED` | Invalid command, configuration, filter, disabled source, foreign live lease, or ordinary failure. |');
     expect(readme).toContain('| `130` | `CANCELLED` | SIGINT or SIGTERM stopped the active command cleanly. |');
     expect(readme).not.toContain('filter, cancellation, or complete failure');
+  });
+
+  it('documents exact opt-in laptop memory measurement commands and stream separation', () => {
+    const readme = readFileSync(resolve(process.cwd(), 'README.md'), 'utf8');
+
+    expect(readme).toContain('pnpm.cmd run scrape:jer:latest -- --measure-memory');
+    expect(readme).toContain('pnpm.cmd run scrape:jer:backfill -- --measure-memory');
+    expect(readme).toContain('stderr');
+    expect(readme).toContain('stdout');
   });
 
   it('parses actual discovered game codes without losing comma-separated filters', () => {

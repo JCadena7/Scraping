@@ -54,6 +54,17 @@ For `backfill`, `--game=CODE` and `--games=A,B` are validated against the persis
 
 Backfill reads a game's available dates, skips dates already persisted, and saves each result immediately. Re-run the same command after interruption to resume; existing dates remain skipped.
 
+### Optional memory measurement
+
+Use the exact valueless `--measure-memory` flag to emit process-memory JSONL to stderr without changing the command summary on stdout:
+
+```bash
+pnpm.cmd run scrape:jer:latest -- --measure-memory
+pnpm.cmd run scrape:jer:backfill -- --measure-memory
+```
+
+The stderr stream contains an immediate `start`, zero or more five-second `running` samples, and a final `end` sample. `peak*Bytes` fields are maxima of those observed samples, not a process high-water guarantee. The flag is opt-in; commands without it emit no memory telemetry.
+
 ## Operational guards
 
 Every JER command acquires the singleton `JER/jer.com.co` source gate and owner-token lease before its first network request. A live foreign lease or `DISABLED` source exits `1` without running; `BLOCKED` exits `3`; `RATE_LIMITED` exits `4`. The owner renews its lease independently while work or a batch pause is in progress and releases it once in finalization.

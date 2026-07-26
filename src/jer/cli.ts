@@ -8,10 +8,12 @@ import { DrawRepository, type RunSummary } from './repository.js';
 import { RenewableLeaseHeartbeat, toOperationalOutcome } from './operational-lifecycle.js';
 import { createSupabaseClient } from './supabase.js';
 import { BackfillJerResultsUseCase, DiscoverJerGamesUseCase, JerSource, SyncJerLatestResultsUseCase, type BackfillOperationalDependencies, type OperationalProgress, type OperationalTransition } from './use-cases.js';
+import { createMemoryObserver, type MemoryObserver } from './memory-observer.js';
 
 const operationalOverrideNames = new Set(['batch-size', 'max-batches', 'max-results', 'max-batches-per-run', 'max-results-per-run', 'request-delay-ms', 'batch-pause-ms', 'concurrency', 'max-retries', 'block-cooldown-ms', 'rate-limit-cooldown-ms', 'lease-duration-ms', 'lease-renew-interval-ms']);
 const backfillFilterNames = new Set(['game', 'games', 'from', 'to']);
-export interface CliDependencies { discover: (signal?: AbortSignal) => Promise<unknown>; latest: (signal?: AbortSignal) => Promise<{ status: string; sourceState?: string }>; backfill: (options: { games?: string[]; from?: string; to?: string; signal?: AbortSignal }) => Promise<{ status: string; sourceState?: string }>; print: (value: unknown) => void; error: (value: string) => void; }
+const backfillNonOverrideNames = new Set([...backfillFilterNames, 'measure-memory']);
+export interface CliDependencies { discover: (signal?: AbortSignal) => Promise<unknown>; latest: (signal?: AbortSignal) => Promise<{ status: string; sourceState?: string }>; backfill: (options: { games?: string[]; from?: string; to?: string; signal?: AbortSignal }) => Promise<{ status: string; sourceState?: string }>; print: (value: unknown) => void; error: (value: string) => void; memoryObserverFactory?: () => MemoryObserver; }
 
 export function parseArgs(values: string[]): Record<string, string> { return Object.fromEntries(values.filter(value => value.startsWith('--')).map(value => { const [key, ...rest] = value.slice(2).split('='); return [key, rest.join('=')]; })); }
 export function parseOperationalOverrides(values: Record<string, string>): JerOperationalOverrides {
@@ -33,11 +35,19 @@ export function parseOperationalOverrides(values: Record<string, string>): JerOp
 }
 export async function runCli(argv: string[], dependencies: CliDependencies, signal?: AbortSignal): Promise<number> {
   const [command, ...values] = argv; const args = parseArgs(values); const games = args.games ? args.games.split(',').map(value => value.trim()).filter(Boolean) : args.game ? [args.game] : undefined;
-  if (command === 'backfill') parseOperationalOverrides(Object.fromEntries(Object.entries(args).filter(([key]) => !backfillFilterNames.has(key))));
+  if (command === 'backfill') parseOperationalOverrides(Object.fromEntries(Object.entries(args).filter(([key]) => !backfillNonOverrideNames.has(key))));
   if (command === 'discover') { const result = await dependencies.discover(signal); dependencies.print(result); return signal?.aborted ? 130 : isCommandSummary(result) ? exitCode(result) : 0; }
-  if (command === 'latest') return exitCode(await dependencies.latest(signal));
-  if (command === 'backfill') return exitCode(await dependencies.backfill({ games, from: args.from, to: args.to, signal }));
+  const measureMemory = (command === 'latest' || command === 'backfill') && args['measure-memory'] === '';
+  if (command === 'latest') return exitCode(await withMemoryObserver(measureMemory, dependencies.memoryObserverFactory, () => dependencies.latest(signal)));
+  if (command === 'backfill') return exitCode(await withMemoryObserver(measureMemory, dependencies.memoryObserverFactory, () => dependencies.backfill({ games, from: args.from, to: args.to, signal })));
   dependencies.error('Usage: pnpm scrape:jer:{discover|latest|backfill} [--game=CODE] [--games=A,B] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD]'); return 1;
+}
+async function withMemoryObserver<T>(enabled: boolean, factory: (() => MemoryObserver) | undefined, operation: () => Promise<T>): Promise<T> {
+  if (!enabled) return operation();
+  let observer: MemoryObserver | undefined;
+  try { observer = factory?.(); } catch { /* telemetry is optional */ }
+  try { try { observer?.start(); } catch { /* telemetry is optional */ } return await operation(); }
+  finally { try { observer?.stop(); } catch { /* telemetry is optional */ } }
 }
 function exitCode(summary: { status: string; sourceState?: string }): number { if (summary.sourceState === 'RATE_LIMITED') return 4; if (summary.status === 'PAUSED') return 0; return summary.status === 'SUCCESS' ? 0 : summary.status === 'PARTIAL' ? 2 : summary.status === 'BLOCKED' ? 3 : summary.status === 'CANCELLED' ? 130 : 1; }
 function isCommandSummary(value: unknown): value is { status: string; sourceState?: string } { return typeof value === 'object' && value !== null && 'status' in value && typeof value.status === 'string'; }
@@ -53,7 +63,7 @@ export async function runWithSignals(operation: (signal: AbortSignal) => Promise
 
 export async function main(): Promise<number> {
   const argv = process.argv.slice(2); const args = parseArgs(argv.slice(1));
-  const operationalArgs = argv[0] === 'backfill' ? Object.fromEntries(Object.entries(args).filter(([key]) => !backfillFilterNames.has(key))) : {};
+  const operationalArgs = argv[0] === 'backfill' ? Object.fromEntries(Object.entries(args).filter(([key]) => !backfillNonOverrideNames.has(key))) : {};
   const config = loadConfig(process.env, parseOperationalOverrides(operationalArgs));
   if (!config.enabled) { console.error('JER scraper is disabled (JER_SCRAPER_ENABLED=false).'); return 1; }
   const repository = new DrawRepository(createSupabaseClient());
@@ -63,7 +73,7 @@ export async function main(): Promise<number> {
     discover: async current => withJerLease(repository, config, current, async (guarded, owner) => { try { const games = await new DiscoverJerGamesUseCase(source, repository).execute(guarded); games.forEach(game => console.log(`${game.code}\t${game.type}\t${game.name}\t${game.detailUrl}`)); return games; } catch (error) { return persistOperationalFailure(repository, owner, undefined, error, config); } }),
     latest: async current => withJerLease(repository, config, current, async (guarded, owner) => { const runId = await repository.startRun('LATEST', owner); try { const summary = await new SyncJerLatestResultsUseCase(source, repository).execute(guarded, runId); printSummary(summary); return summary; } catch (error) { const summary = await persistOperationalFailure(repository, owner, runId, error, config); printSummary(summary); return summary; } }),
     backfill: async options => { const summary = await new BackfillJerResultsUseCase(source, repository, createOperationalDependencies(repository, config)).executeOperational(options); printSummary(summary); return summary; },
-    print: value => console.log(value), error: value => console.error(value)
+    print: value => console.log(value), error: value => console.error(value), memoryObserverFactory: createMemoryObserver
   }, signal));
 }
 function printSummary(summary: { id: string; status: string; gamesQueried: number; datesQueried: number; resultsFound: number; resultsInserted: number; resultsUpdated: number; resultsSkipped: number; errors: string[] }) { console.log(JSON.stringify(summary, null, 2)); }

@@ -58,6 +58,16 @@ describe('guarded operational backfill', () => {
     expect(f.source.historical).not.toHaveBeenCalled();
   });
 
+  it('releases an acquired lease once after a terminal operational failure', async () => {
+    const f = fixture();
+    f.source.discover.mockRejectedValueOnce(new Error('catalog unavailable'));
+
+    await expect(new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational()).resolves.toMatchObject({ status: 'FAILED' });
+    expect(f.dependencies.acquireAndGate).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
+    expect(f.repository.finishRun).toHaveBeenCalledWith('run-1', expect.any(Object), 'FAILED');
+  });
+
   it('shares a global result budget across games and persists an attempt immediately before each POST', async () => {
     const f = fixture({ maxResults: 2, batchSize: 5 });
     const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();

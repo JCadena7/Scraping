@@ -1,6 +1,7 @@
 import { JerBlockedError, JerHttpError, JerRateLimitError } from './domain.js';
 
 export interface JerHttpClientOptions { timeoutMs: number; delayMs: number; maxRetries: number; userAgent: string; fetchImpl?: typeof fetch; sleepImpl?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; random?: () => number; backoffImpl?: (attempt: number) => number; logger?: (event: Record<string, unknown>) => void; }
+export interface JerTransport { get(url: string, signal?: AbortSignal): Promise<string>; postForm(url: string, values: Record<string, string>, signal?: AbortSignal): Promise<string>; }
 type Queue = Promise<void>;
 
 const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {

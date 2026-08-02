@@ -35,7 +35,13 @@ const env = z.object({
   JER_BLOCK_COOLDOWN_MS: z.string().optional(),
   JER_RATE_LIMIT_COOLDOWN_MS: z.string().optional(),
   JER_LEASE_DURATION_MS: z.string().optional(),
-  JER_LEASE_RENEW_INTERVAL_MS: z.string().optional()
+  JER_LEASE_RENEW_INTERVAL_MS: z.string().optional(),
+  JER_PROVIDER: z.enum(['DIRECT', 'SCRAPEDO']).default('DIRECT'),
+  JER_SCRAPEDO_TOKEN: z.string().optional(),
+  JER_SCRAPEDO_ENDPOINT: z.string().url().default('https://api.scrape.do/'),
+  JER_SCRAPEDO_SUPER_ENABLED: z.enum(['true', 'false']).default('false'),
+  JER_SCRAPEDO_MAX_STANDARD_BLOCKED_SESSIONS: z.coerce.number().int().min(1).max(1000).default(2),
+  JER_SCRAPEDO_MAX_RETRIES: z.coerce.number().int().min(1).max(1).default(1)
 }).strict();
 
 const operationalOverridesSchema = operationalConfigValues.partial().strict();
@@ -48,14 +54,23 @@ export interface JerConfig extends z.output<typeof operationalConfigSchema> {
   userAgent: string;
   enabled: boolean;
   databasePath: string;
+  provider: JerProviderConfig;
 }
+
+export type JerProviderConfig = { kind: 'DIRECT' } | { kind: 'SCRAPEDO'; endpoint: string; token: string; superEnabled: boolean; maxStandardBlockedSessions: number; maxRetries: 1 };
 
 export function parseOperationalOverrides(values: unknown): JerOperationalOverrides {
   return operationalOverridesSchema.parse(values);
 }
 
 export function loadConfig(values: NodeJS.ProcessEnv = process.env, overrides: JerOperationalOverrides = {}): JerConfig {
-  const parsed = env.parse(selectJerValues(values));
+  const selected = selectJerValues(values);
+  let parsed: z.output<typeof env>;
+  try { parsed = env.parse(selected); }
+  catch (error) {
+    if (selected.JER_PROVIDER === 'SCRAPEDO') throw new Error('Invalid Scrape.do configuration');
+    throw error;
+  }
   const operational = operationalConfigSchema.parse({
     batchSize: parsed.JER_BATCH_SIZE,
     maxBatchesPerRun: parsed.JER_MAX_BATCHES_PER_RUN,
@@ -71,7 +86,13 @@ export function loadConfig(values: NodeJS.ProcessEnv = process.env, overrides: J
     ...parseOperationalOverrides(overrides)
   });
   const baseUrl = parsed.JER_RESULTS_BASE_URL.replace(/\/$/, '');
-  return { baseUrl, resultsUrl: `${baseUrl}${parsed.JER_RESULTS_PATH.startsWith('/') ? parsed.JER_RESULTS_PATH : `/${parsed.JER_RESULTS_PATH}`}`, timeoutMs: parsed.JER_REQUEST_TIMEOUT_MS, userAgent: parsed.JER_USER_AGENT, enabled: parsed.JER_SCRAPER_ENABLED === 'true', databasePath: parsed.JER_DATABASE_PATH, ...operational };
+  const provider = parsed.JER_PROVIDER === 'DIRECT' ? { kind: 'DIRECT' as const } : scrapedoProvider(parsed);
+  return { baseUrl, resultsUrl: `${baseUrl}${parsed.JER_RESULTS_PATH.startsWith('/') ? parsed.JER_RESULTS_PATH : `/${parsed.JER_RESULTS_PATH}`}`, timeoutMs: parsed.JER_REQUEST_TIMEOUT_MS, userAgent: parsed.JER_USER_AGENT, enabled: parsed.JER_SCRAPER_ENABLED === 'true', databasePath: parsed.JER_DATABASE_PATH, provider, ...operational };
+}
+
+function scrapedoProvider(parsed: z.output<typeof env>): JerProviderConfig {
+  if (!parsed.JER_SCRAPEDO_TOKEN?.trim()) throw new Error('Invalid Scrape.do configuration');
+  return { kind: 'SCRAPEDO', endpoint: parsed.JER_SCRAPEDO_ENDPOINT, token: parsed.JER_SCRAPEDO_TOKEN, superEnabled: parsed.JER_SCRAPEDO_SUPER_ENABLED === 'true', maxStandardBlockedSessions: parsed.JER_SCRAPEDO_MAX_STANDARD_BLOCKED_SESSIONS, maxRetries: 1 };
 }
 
 function selectJerValues(values: NodeJS.ProcessEnv): Record<string, string | undefined> {

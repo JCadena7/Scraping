@@ -37,6 +37,64 @@ SUPABASE_SERVICE_ROLE_KEY=your-server-only-key
 
 Apply migrations in order: first `202607230001_draw_results.sql`, then `202607240001_harden_jer_persistence.sql`. Deploy application code that requires the service-role key only after the security migration is live.
 
+### Optional Scrape.do backfill provider
+
+**Direct is the default.** Leave `JER_PROVIDER` unset (or set it to `DIRECT`) for the Render discovery/latest/backfill workflow and its existing shared Supabase writes. Scrape.do is available only for `backfill`: an **operational local backfill**; it is not supported for deployed Render discovery or latest collection.
+
+Do not create or commit another environment file. Add these values only to the existing local environment configuration, using a placeholder token in examples:
+
+```env
+# Omit JER_PROVIDER, or use DIRECT, for the default transport.
+JER_PROVIDER=SCRAPEDO
+JER_SCRAPEDO_TOKEN=replace-with-your-scrapedo-token
+JER_SCRAPEDO_ENDPOINT=https://api.scrape.do/
+JER_SCRAPEDO_SUPER_ENABLED=false
+JER_SCRAPEDO_MAX_STANDARD_BLOCKED_SESSIONS=2
+JER_SCRAPEDO_MAX_RETRIES=1
+```
+
+```bash
+# Scrape.do is allowed only for a deliberately filtered local backfill.
+pnpm scrape:jer:backfill --game=CHONTICO_DIA --from=2026-07-01 --to=2026-07-25
+```
+
+With `JER_PROVIDER=SCRAPEDO`, `discover` and `latest` fail fast before a Supabase client, repository, lease, runtime, network request, or database access is constructed. There is no direct fallback for an explicit invalid or incomplete Scrape.do configuration. `backfill` keeps the existing shared Supabase result writes and operational controls.
+
+| Variable | Default and validation | Meaning |
+|---|---|---|
+| `JER_PROVIDER` | `DIRECT`; only `DIRECT` or `SCRAPEDO` | Selects the transport. Unset remains direct. |
+| `JER_SCRAPEDO_TOKEN` | Required, non-blank when provider is `SCRAPEDO` | Server-only API token. Invalid explicit Scrape.do configuration fails without falling back to direct. |
+| `JER_SCRAPEDO_ENDPOINT` | `https://api.scrape.do/`; must be a URL | API Mode endpoint. |
+| `JER_SCRAPEDO_SUPER_ENABLED` | `false`; literal `true` or `false` | Allows Super only after a pending-Super state is persisted; it does not enable Super immediately. Disabled Super at that boundary is terminal. |
+| `JER_SCRAPEDO_MAX_STANDARD_BLOCKED_SESSIONS` | `2`; integer 1–1000 | Consecutive invalidated **Standard sessions** before pending Super, not rotations per request. A valid Standard response resets this count. |
+| `JER_SCRAPEDO_MAX_RETRIES` | `1`; literal integer 1 only | The hard maximum: one rotation/retry per logical request, never an unbounded retry setting. |
+
+`JER_SCRAPEDO_MAX_STANDARD_BLOCKED_SESSIONS` is the actual configuration name. It counts confirmed target 403/verification invalidations of Standard sessions; the original request and its one replacement retry can therefore contribute two invalidations. At threshold, the run persists `pendingSuper`; Super starts only on the next operationally permitted request. A Super session is invalidated on a confirmed block but is not rotated by this policy.
+
+### Scrape.do request, session, and failure semantics
+
+The provider uses Scrape.do **API Mode** with `transparentResponse=true`. Target URLs are encoded once by the client, not pre-encoded in configuration. GET and JER POST-form requests retain their method, form body, `Content-Type`, and request headers. The repository has deterministic tests for POST forwarding, but vendor documentation has not been treated as proof that all POST forwarding behavior is supported; that remains an official-documentation evidence gap.
+
+The provider sets no `render`, browser, CAPTCHA, geo, or proxy-mode options. It uses a sticky `sessionId` only. Scrape.do documents `sessionId` as an integer from 0 through 1,000,000 and says an idle sticky assignment is physically closed after approximately five minutes. The persisted ID is logical continuity for this run; it does **not** guarantee the same physical IP indefinitely.
+
+| Observed result | Provider action | Session/source effect |
+|---|---|---|
+| Trusted target 403 or narrow verification phrase | Blocked | Invalidates Standard; at most one replacement retry. |
+| Trusted target 429 (matching target URL and initial-status header) | Rate limited | Existing source cooldown/`RATE_LIMITED` path; no rotation. |
+| Provider 429 without trusted target evidence | One same-session, same-tier delayed retry | Then provider failure; no cooldown, rotation, or Super. |
+| Provider 401, 400, 502, 510, auth throttling, timeout, or network failure | Provider failure | No rotation, cooldown, or Super. |
+| Unknown or structurally invalid HTML | Structure/unknown-HTML failure | No rotation, cooldown, or Super. |
+
+### Cost, database rollout, and safety limits
+
+Scrape.do's published untargeted baseline is 1 credit for Standard and 10 credits for Super. The `Scrape.do-Request-Cost` response header is authoritative because vendor domain profiles can override a baseline. This work did not execute real, billable, or live-provider tests.
+
+The shared production database rollout is additive: `202607270001_scrapedo_jer_provider_state.sql` adds nullable `provider_state` only to `draw_ingestion_runs`. Existing Render/direct rows, legacy RPCs, and direct application behavior remain compatible; the new start/resume and provider-progress RPCs are used only by Scrape.do backfill. **This documentation work has not applied that migration.** Apply prior draw/hardening/operational migrations first, then apply migration 001 before deploying a Scrape.do-backfill caller. If it is already applied, do not edit its history; use a separate transactional migration for later changes. Roll back by disabling the provider and retaining the inert additive schema/RPCs rather than removing shared production state.
+
+Never log, print, commit, or expose the Scrape.do token, provider API URL, sticky session ID, request/form body, Supabase key, or other secrets. The supplied tests are deterministic local checks; they do not prove vendor behavior, account availability, target access, billing, or a production rollout.
+
+Official references: [Scrape.do API Mode and parameters](https://scrape.do/documentation/), [session ID behavior](https://scrape.do/documentation/api-response/session-id/), [transparent response headers](https://scrape.do/documentation/api-response/response-output/#transparent-response), and [request costs](https://scrape.do/documentation/request-costs/).
+
 ## CLI behavior
 
 | Exit code | Status | Meaning |

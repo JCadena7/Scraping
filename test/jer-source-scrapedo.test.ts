@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { JerBlockedError, JerHtmlStructureChangedError, JerRateLimitError, type DiscoveredGame, type NormalizedDrawResult } from '../src/jer/domain.js';
 import { ScrapedoRuntime, ProviderStateCommitter } from '../src/jer/scrapedo-runtime.js';
@@ -13,6 +14,7 @@ function sourceWithRuntime(options: {
   initial?: ProviderStateV1;
   policy?: { execute(previous: ProviderStateV1 | undefined, request: (attempt: SessionAttempt) => Promise<SessionAttemptOutcome>): Promise<{ state: ProviderStateV1; attempts: SessionAttempt[]; outcome: string }>; };
   response?: { status: number; headers?: Record<string, string>; body: string };
+  logger?: (event: Record<string, unknown>) => void;
 }) {
   const attempts: SessionAttempt[] = [];
   const requestRaw = vi.fn(async () => ({ status: options.response?.status ?? 200, headers: new Headers(options.response?.headers), body: options.response?.body ?? 'ok' }));
@@ -27,7 +29,7 @@ function sourceWithRuntime(options: {
   if (options.initial) runtime.bind({ runId: 'run-1', ownerToken: 'owner-1', committed: { version: 1, requestToken: 'resume-token', providerState: options.initial } });
   const main = { parseGames: vi.fn(() => [game]), parseLatest: vi.fn(() => ({ results: [draw], rejected: [] })) };
   const history = { getDates: vi.fn(() => ['2026-07-01']), parse: vi.fn(() => draw) };
-  const source = new JerSource({ get: vi.fn(), postForm: vi.fn() } as never, main as never, history as never, 'https://jer.example/results', { runtime, progress: () => progress, transportFactory: attempt => { attempts.push(attempt); return { requestRaw }; } });
+  const source = new JerSource({ get: vi.fn(), postForm: vi.fn() } as never, main as never, history as never, 'https://jer.example/results', { runtime, progress: () => progress, transportFactory: (attempt: SessionAttempt) => { attempts.push(attempt); return { requestRaw }; }, logger: options.logger } as never);
   return { source, runtime, requestRaw, save, attempts, main, history };
 }
 
@@ -142,5 +144,34 @@ describe('JerSource Scrape.do request executor', () => {
     broken.main.parseGames.mockImplementation(() => { throw new JerHtmlStructureChangedError('changed'); });
     await expect(broken.source.discover()).rejects.toThrow('changed');
     expect(broken.save).toHaveBeenCalledWith(expect.objectContaining({ providerState: expect.objectContaining({ sessionId: 42 }) }));
+  });
+
+  it('logs bounded redacted diagnostics when a Scrape.do 2xx date page is unknown HTML', async () => {
+    const logger = vi.fn();
+    const title = `Unexpected provider response ${'x'.repeat(140)}`;
+    const body = `<html><head><title>${title}</title></head><body>private-body-value</body></html>`;
+    const f = sourceWithRuntime({ initial: state(), response: { status: 200, body }, logger });
+    f.history.getDates.mockImplementation(() => { throw new JerHtmlStructureChangedError('Date selector select[name="fecha"] was not found'); });
+
+    await expect(f.source.dates(game.detailUrl)).rejects.toMatchObject({ code: 'JER_HTML_STRUCTURE_CHANGED' });
+
+    expect(logger).toHaveBeenCalledOnce();
+    expect(logger).toHaveBeenCalledWith({
+      provider: 'SCRAPEDO',
+      classification: 'unknown_html',
+      operation: 'dates',
+      method: 'GET',
+      targetUrl: game.detailUrl,
+      bodyBytes: Buffer.byteLength(body, 'utf8'),
+      bodyCharacters: [...body].length,
+      title: title.slice(0, 120),
+      bodySha256: createHash('sha256').update(body).digest('hex').slice(0, 12),
+      expectedMarkers: { hasDateSelector: false },
+    });
+    const serialized = JSON.stringify(logger.mock.calls);
+    expect(serialized).not.toContain('private-body-value');
+    expect(serialized).not.toContain('api.scrape.do');
+    expect(serialized).not.toContain('token');
+    expect(f.save).toHaveBeenCalledWith(expect.objectContaining({ providerState: expect.objectContaining({ sessionId: 42 }) }));
   });
 });

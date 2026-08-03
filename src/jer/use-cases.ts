@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import * as cheerio from 'cheerio';
 import { DiscoveredGame, JerBlockedError, JerError, JerHtmlStructureChangedError, JerRateLimitError, NormalizedDrawResult, assertDate, type IngestionStatus, type SourceState } from './domain.js';
 import { type JerTransport } from './http-client.js';
 import { JerHistoryParser } from './history-parser.js';
@@ -13,10 +15,10 @@ export class JerSource {
   constructor(private readonly http: JerTransport, private readonly main: JerMainPageParser, private readonly history: JerHistoryParser, private readonly resultsUrl: string, scrapedo?: ScrapedoSourceRuntime) { this.scrapedo = scrapedo; }
   bindScrapedo(runtime: ScrapedoSourceRuntime): void { if (this.scrapedo) throw new Error('Scrape.do source is already bound'); this.scrapedo = runtime; }
   canRetryScrapedoBlockedRequest(): boolean { return this.scrapedo?.runtime.canRetryBlockedRequest() ?? false; }
-  async discover(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseGames(html), signal); }
-  async latest(games: DiscoveredGame[], signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseLatest(html, games), signal); }
-  async mainSnapshot(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => { const games = this.main.parseGames(html); return { games, latest: this.main.parseLatest(html, games) }; }, signal); }
-  async dates(url: string, signal?: AbortSignal) { return this.execute(url, { method: 'GET' }, html => this.history.getDates(html), signal); }
+  async discover(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseGames(html), 'discover', signal); }
+  async latest(games: DiscoveredGame[], signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseLatest(html, games), 'latest', signal); }
+  async mainSnapshot(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => { const games = this.main.parseGames(html); return { games, latest: this.main.parseLatest(html, games) }; }, 'main_snapshot', signal); }
+  async dates(url: string, signal?: AbortSignal) { return this.execute(url, { method: 'GET' }, html => this.history.getDates(html), 'dates', signal); }
   async historical(game: DiscoveredGame, date: string, signal?: AbortSignal): Promise<NormalizedDrawResult | null> {
     assertDate(date);
     if (!this.scrapedo) return this.history.parse(await this.http.postForm(game.detailUrl, { fecha: date }, signal), game, date, game.detailUrl);
@@ -25,16 +27,16 @@ export class JerSource {
       if (classified.kind === 'valid_no_results') return null;
       if (classified.kind === 'verification_page') throw new JerError('JER verification page', 'JER_VERIFICATION_PAGE');
       return classified.result;
-    }, signal, true);
+    }, 'historical', signal, true);
   }
 
-  private async execute<T>(url: string, init: RequestInit, parse: (html: string) => T, signal?: AbortSignal, allowNoResults = false): Promise<T> {
+  private async execute<T>(url: string, init: RequestInit, parse: (html: string) => T, htmlOperation: ScrapedoHtmlOperation, signal?: AbortSignal, allowNoResults = false): Promise<T> {
     if (!this.scrapedo) return parse(init.method === 'POST' ? await this.http.postForm(url, Object.fromEntries(new URLSearchParams(String(init.body))), signal) : await this.http.get(url, signal));
     const scrapedo = this.scrapedo;
     const attemptFactory = ((attempt: SessionAttempt) => async (currentSignal?: AbortSignal) => {
       try {
         const response = await scrapedo.transportFactory(attempt).requestRaw(url, init, currentSignal);
-        return classifyScrapedoResponse(response, url, html => this.classifyBody(html, parse, allowNoResults));
+        return classifyScrapedoResponse(response, url, html => this.classifyBody(html, parse, allowNoResults, htmlOperation, url, init.method ?? 'GET'));
       } catch (error) { return classifyScrapedoFailure(error, currentSignal); }
     }) as never;
     const operation = await scrapedo.runtime.executeFrom(scrapedo.progress, signal, attemptFactory) as JerOperation<T>;
@@ -42,7 +44,7 @@ export class JerSource {
     throw operationError(operation, url);
   }
 
-  private classifyBody<T>(html: string, parse: (html: string) => T, allowNoResults: boolean): JerOperation<T> {
+  private classifyBody<T>(html: string, parse: (html: string) => T, allowNoResults: boolean, operation: ScrapedoHtmlOperation, targetUrl: string, method: string): JerOperation<T> {
     if (isVerificationPage(html)) return { ok: false, classification: 'verification_page', error: new JerError('JER verification page', 'JER_VERIFICATION_PAGE') };
     try {
       const value = parse(html);
@@ -51,13 +53,36 @@ export class JerSource {
         : { ok: true, classification: 'valid_results', value };
     }
     catch (error) {
+      if (error instanceof JerHtmlStructureChangedError) {
+        try { this.scrapedo?.logger?.(unknownHtmlDiagnostic(html, operation, targetUrl, method)); } catch { /* Diagnostics must not change domain classification. */ }
+      }
       return { ok: false, classification: error instanceof JerHtmlStructureChangedError ? 'unknown_html' : 'provider_error', error: error instanceof JerError ? error : new ScrapedoProviderError() };
     }
   }
 }
 
 export interface ScrapedoRequestTransport { requestRaw(targetUrl: string, init: RequestInit, signal?: AbortSignal): Promise<ScrapedoRawResponse>; }
-export interface ScrapedoSourceRuntime { runtime: ScrapedoRuntime<unknown>; progress: ProgressSupplier; transportFactory(attempt: SessionAttempt): ScrapedoRequestTransport; }
+export interface ScrapedoSourceRuntime { runtime: ScrapedoRuntime<unknown>; progress: ProgressSupplier; transportFactory(attempt: SessionAttempt): ScrapedoRequestTransport; logger?: (event: Record<string, unknown>) => void; }
+type ScrapedoHtmlOperation = 'discover' | 'latest' | 'main_snapshot' | 'dates' | 'historical';
+
+function unknownHtmlDiagnostic(html: string, operation: ScrapedoHtmlOperation, targetUrl: string, method: string): Record<string, unknown> {
+  const $ = cheerio.load(html);
+  const title = $('title').first().text().replace(/\s+/g, ' ').trim().slice(0, 120);
+  const expectedMarkers = operation === 'dates'
+    ? { hasDateSelector: $('select[name="fecha"]').length > 0 }
+    : operation === 'historical'
+      ? { hasDateSelector: $('select[name="fecha"]').length > 0, hasHistoricalResultRegion: $('.resultado-historico, .resultado-sorteo').length > 0 }
+      : operation === 'latest'
+        ? { hasLatestResultsTable: $('table.tablaresultados').length > 0 }
+        : operation === 'discover'
+          ? { hasGameLink: $('a.botonres_vmas, a[href*="/resultados/"]').length > 0 }
+          : { hasGameLink: $('a.botonres_vmas, a[href*="/resultados/"]').length > 0, hasLatestResultsTable: $('table.tablaresultados').length > 0 };
+  return {
+    provider: 'SCRAPEDO', classification: 'unknown_html', operation, method, targetUrl,
+    bodyBytes: Buffer.byteLength(html, 'utf8'), bodyCharacters: [...html].length,
+    ...(title ? { title } : {}), bodySha256: createHash('sha256').update(html).digest('hex').slice(0, 12), expectedMarkers,
+  };
+}
 function operationError<T>(operation: Extract<JerOperation<T>, { ok: false }>, url: string): JerError {
   if (operation.classification === 'blocked') return new JerBlockedError('JER target returned HTTP 403', 403, url);
   if (operation.classification === 'rate_limited') return new JerRateLimitError('JER target returned HTTP 429', 429, url);
@@ -202,7 +227,14 @@ export class BackfillJerResultsUseCase {
       const pending: Array<{ game: DiscoveredGame; date: string }> = [];
       for (const game of selected) {
         await ensure();
-        const dates = await this.source.dates(game.detailUrl, controller.signal);
+        let dates: string[];
+        try { dates = await this.source.dates(game.detailUrl, controller.signal); }
+        catch (error) {
+          if (!(error instanceof JerHtmlStructureChangedError)) throw error;
+          progress.failed++;
+          summary.errors.push(`${game.code}: ${messageOf(error)}`);
+          continue;
+        }
         const existing = new Set(await this.repository.existingDates(game.code, options.from, options.to));
         for (const date of dates.sort()) {
           if ((!options.from || date >= options.from) && (!options.to || date <= options.to) && !existing.has(date)) pending.push({ game, date });

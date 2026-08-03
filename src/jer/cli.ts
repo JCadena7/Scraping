@@ -96,7 +96,8 @@ export function createOperationalDependencies(repository: DrawRepository, config
       const committer = new ProviderStateCommitter({ save: write => repository.saveJerProgressWithProviderState(write.runId, write) });
       const runtime = new ScrapedoRuntime({ policy, committer, retryDelayMs: config.delayMs, sleep: sleepWithAbort });
       runtime.bind({ runId: resumed.runId, ownerToken, committed: { version: resumed.version, requestToken: resumed.requestToken, providerState: state } });
-      source.bindScrapedo({ runtime, progress, transportFactory: attempt => new ScrapedoHttpClient({ endpoint: scrapedoProvider.endpoint, token: scrapedoProvider.token, timeoutMs: config.timeoutMs, userAgent: config.userAgent, sessionId: attempt.sessionId, super: attempt.transportOptions.super, logger: event => console.error(JSON.stringify(event)) }) });
+      const logger = (event: Record<string, unknown>) => console.error(JSON.stringify(event));
+      source.bindScrapedo({ runtime, progress, transportFactory: attempt => new ScrapedoHttpClient({ endpoint: scrapedoProvider.endpoint, token: scrapedoProvider.token, timeoutMs: config.timeoutMs, userAgent: config.userAgent, sessionId: attempt.sessionId, super: attempt.transportOptions.super, logger }), logger });
       return { runId: resumed.runId, saveProgress: async write => { await runtime.saveProgress(write); } };
     } : undefined,
     transition403: async (runId: string, details: OperationalTransition) => { await repository.transitionJer403(ownerToken, runId, details.cooldownMs, details.error); }, transition429: async (runId: string, details: OperationalTransition) => { await repository.transitionJer429(ownerToken, runId, details.cooldownMs, details.error); }, sleep: sleepWithAbort };

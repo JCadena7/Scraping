@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { JerBlockedError, JerRateLimitError, type DiscoveredGame, type NormalizedDrawResult } from '../src/jer/domain.js';
+import { JerBlockedError, JerHtmlStructureChangedError, JerRateLimitError, type DiscoveredGame, type NormalizedDrawResult } from '../src/jer/domain.js';
 import { BackfillJerResultsUseCase, type BackfillOperationalDependencies } from '../src/jer/use-cases.js';
 import { ScrapedoSessionPolicy, type ProviderStateV1, type SessionAttempt, type SessionIdGenerator } from '../src/jer/session-policy.js';
 import { ProviderStateCommitter, ScrapedoProviderError, ScrapedoRuntime, type ProgressWriteWithoutVersionTokenProviderState, type ProviderStateWriter } from '../src/jer/scrapedo-runtime.js';
@@ -190,6 +190,20 @@ describe('guarded operational backfill', () => {
     fatal.repository.upsertResult.mockRejectedValueOnce(new Error('database down'));
     await expect(new BackfillJerResultsUseCase(fatal.source as never, fatal.repository as never, fatal.dependencies).executeOperational()).resolves.toMatchObject({ status: 'FAILED' });
     expect(fatal.calls.filter(call => call.startsWith('POST:'))).toEqual(['POST:A/2026-07-01']);
+  });
+
+  it('records an invalid date page per game and processes valid pending dates from later games', async () => {
+    const f = fixture();
+    f.source.dates.mockRejectedValueOnce(new JerHtmlStructureChangedError('Date selector select[name="fecha"] was not found'));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'PARTIAL', gamesQueried: 2, datesQueried: 1, resultsInserted: 1 });
+    expect(summary.errors).toEqual(['A: Date selector select[name="fecha"] was not found']);
+    expect(f.source.dates).toHaveBeenCalledTimes(2);
+    expect(f.calls.filter(call => call.startsWith('POST:'))).toEqual(['POST:B/2026-07-03']);
+    expect(f.repository.finishRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ errors: summary.errors }), 'PARTIAL');
+    expect((f.dependencies.saveProgress as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toMatchObject({ status: 'PARTIAL', failed: 1 });
   });
 
   it('gives a bound Scrape.do runtime one replacement request before transitioning a second target block', async () => {

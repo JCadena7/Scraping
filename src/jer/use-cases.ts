@@ -1,17 +1,92 @@
-import { DiscoveredGame, JerBlockedError, JerRateLimitError, NormalizedDrawResult, assertDate, type IngestionStatus, type SourceState } from './domain.js';
-import { JerHttpClient } from './http-client.js';
+import { createHash } from 'node:crypto';
+import * as cheerio from 'cheerio';
+import { DiscoveredGame, JerBlockedError, JerError, JerHtmlStructureChangedError, JerRateLimitError, NormalizedDrawResult, assertDate, type IngestionStatus, type SourceState } from './domain.js';
+import { type JerTransport } from './http-client.js';
 import { JerHistoryParser } from './history-parser.js';
 import { JerMainPageParser } from './main-page-parser.js';
 import { DrawRepository, RunSummary } from './repository.js';
 import { RenewableLeaseHeartbeat, toOperationalOutcome } from './operational-lifecycle.js';
+import { isVerificationPage, classifyHistoricalHtml } from './response-classifier.js';
+import { ScrapedoProviderError, ScrapedoRuntime, classifyScrapedoFailure, classifyScrapedoResponse, type JerOperation, type ProgressSupplier, type ProgressWriteWithoutVersionTokenProviderState, type ScrapedoRawResponse } from './scrapedo-runtime.js';
+import type { SessionAttempt } from './session-policy.js';
 
 export class JerSource {
-  constructor(private readonly http: JerHttpClient, private readonly main: JerMainPageParser, private readonly history: JerHistoryParser, private readonly resultsUrl: string) {}
-  async discover(signal?: AbortSignal) { return this.main.parseGames(await this.http.get(this.resultsUrl, signal)); }
-  async latest(games: DiscoveredGame[], signal?: AbortSignal) { return this.main.parseLatest(await this.http.get(this.resultsUrl, signal), games); }
-  async mainSnapshot(signal?: AbortSignal) { const html = await this.http.get(this.resultsUrl, signal); const games = this.main.parseGames(html); return { games, latest: this.main.parseLatest(html, games) }; }
-  async dates(url: string, signal?: AbortSignal) { return this.history.getDates(await this.http.get(url, signal)); }
-  async historical(game: DiscoveredGame, date: string, signal?: AbortSignal): Promise<NormalizedDrawResult> { assertDate(date); return this.history.parse(await this.http.postForm(game.detailUrl, { fecha: date }, signal), game, date, game.detailUrl); }
+  private scrapedo?: ScrapedoSourceRuntime;
+  constructor(private readonly http: JerTransport, private readonly main: JerMainPageParser, private readonly history: JerHistoryParser, private readonly resultsUrl: string, scrapedo?: ScrapedoSourceRuntime) { this.scrapedo = scrapedo; }
+  bindScrapedo(runtime: ScrapedoSourceRuntime): void { if (this.scrapedo) throw new Error('Scrape.do source is already bound'); this.scrapedo = runtime; }
+  canRetryScrapedoBlockedRequest(): boolean { return this.scrapedo?.runtime.canRetryBlockedRequest() ?? false; }
+  async discover(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseGames(html), 'discover', signal); }
+  async latest(games: DiscoveredGame[], signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => this.main.parseLatest(html, games), 'latest', signal); }
+  async mainSnapshot(signal?: AbortSignal) { return this.execute(this.resultsUrl, { method: 'GET' }, html => { const games = this.main.parseGames(html); return { games, latest: this.main.parseLatest(html, games) }; }, 'main_snapshot', signal); }
+  async dates(url: string, signal?: AbortSignal) { return this.execute(url, { method: 'GET' }, html => this.history.getDates(html), 'dates', signal); }
+  async historical(game: DiscoveredGame, date: string, signal?: AbortSignal): Promise<NormalizedDrawResult | null> {
+    assertDate(date);
+    if (!this.scrapedo) return this.history.parse(await this.http.postForm(game.detailUrl, { fecha: date }, signal), game, date, game.detailUrl);
+    return this.execute(game.detailUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ fecha: date }).toString() }, html => {
+      const classified = classifyHistoricalHtml(html, this.history, game, date, game.detailUrl);
+      if (classified.kind === 'valid_no_results') return null;
+      if (classified.kind === 'verification_page') throw new JerError('JER verification page', 'JER_VERIFICATION_PAGE');
+      return classified.result;
+    }, 'historical', signal, true);
+  }
+
+  private async execute<T>(url: string, init: RequestInit, parse: (html: string) => T, htmlOperation: ScrapedoHtmlOperation, signal?: AbortSignal, allowNoResults = false): Promise<T> {
+    if (!this.scrapedo) return parse(init.method === 'POST' ? await this.http.postForm(url, Object.fromEntries(new URLSearchParams(String(init.body))), signal) : await this.http.get(url, signal));
+    const scrapedo = this.scrapedo;
+    const attemptFactory = ((attempt: SessionAttempt) => async (currentSignal?: AbortSignal) => {
+      try {
+        const response = await scrapedo.transportFactory(attempt).requestRaw(url, init, currentSignal);
+        return classifyScrapedoResponse(response, url, html => this.classifyBody(html, parse, allowNoResults, htmlOperation, url, init.method ?? 'GET'));
+      } catch (error) { return classifyScrapedoFailure(error, currentSignal); }
+    }) as never;
+    const operation = await scrapedo.runtime.executeFrom(scrapedo.progress, signal, attemptFactory) as JerOperation<T>;
+    if (operation.ok) return operation.value as T;
+    throw operationError(operation, url);
+  }
+
+  private classifyBody<T>(html: string, parse: (html: string) => T, allowNoResults: boolean, operation: ScrapedoHtmlOperation, targetUrl: string, method: string): JerOperation<T> {
+    if (isVerificationPage(html)) return { ok: false, classification: 'verification_page', error: new JerError('JER verification page', 'JER_VERIFICATION_PAGE') };
+    try {
+      const value = parse(html);
+      return allowNoResults && value === null
+        ? { ok: true, classification: 'valid_no_results', value: null }
+        : { ok: true, classification: 'valid_results', value };
+    }
+    catch (error) {
+      if (error instanceof JerHtmlStructureChangedError) {
+        try { this.scrapedo?.logger?.(unknownHtmlDiagnostic(html, operation, targetUrl, method)); } catch { /* Diagnostics must not change domain classification. */ }
+      }
+      return { ok: false, classification: error instanceof JerHtmlStructureChangedError ? 'unknown_html' : 'provider_error', error: error instanceof JerError ? error : new ScrapedoProviderError() };
+    }
+  }
+}
+
+export interface ScrapedoRequestTransport { requestRaw(targetUrl: string, init: RequestInit, signal?: AbortSignal): Promise<ScrapedoRawResponse>; }
+export interface ScrapedoSourceRuntime { runtime: ScrapedoRuntime<unknown>; progress: ProgressSupplier; transportFactory(attempt: SessionAttempt): ScrapedoRequestTransport; logger?: (event: Record<string, unknown>) => void; }
+type ScrapedoHtmlOperation = 'discover' | 'latest' | 'main_snapshot' | 'dates' | 'historical';
+
+function unknownHtmlDiagnostic(html: string, operation: ScrapedoHtmlOperation, targetUrl: string, method: string): Record<string, unknown> {
+  const $ = cheerio.load(html);
+  const title = $('title').first().text().replace(/\s+/g, ' ').trim().slice(0, 120);
+  const expectedMarkers = operation === 'dates'
+    ? { hasDateSelector: $('select[name="fecha"]').length > 0 }
+    : operation === 'historical'
+      ? { hasDateSelector: $('select[name="fecha"]').length > 0, hasHistoricalResultRegion: $('.resultado-historico, .resultado-sorteo').length > 0 }
+      : operation === 'latest'
+        ? { hasLatestResultsTable: $('table.tablaresultados').length > 0 }
+        : operation === 'discover'
+          ? { hasGameLink: $('a.botonres_vmas, a[href*="/resultados/"]').length > 0 }
+          : { hasGameLink: $('a.botonres_vmas, a[href*="/resultados/"]').length > 0, hasLatestResultsTable: $('table.tablaresultados').length > 0 };
+  return {
+    provider: 'SCRAPEDO', classification: 'unknown_html', operation, method, targetUrl,
+    bodyBytes: Buffer.byteLength(html, 'utf8'), bodyCharacters: [...html].length,
+    ...(title ? { title } : {}), bodySha256: createHash('sha256').update(html).digest('hex').slice(0, 12), expectedMarkers,
+  };
+}
+function operationError<T>(operation: Extract<JerOperation<T>, { ok: false }>, url: string): JerError {
+  if (operation.classification === 'blocked') return new JerBlockedError('JER target returned HTTP 403', 403, url);
+  if (operation.classification === 'rate_limited') return new JerRateLimitError('JER target returned HTTP 429', 429, url);
+  return operation.error;
 }
 
 export class DiscoverJerGamesUseCase {
@@ -65,6 +140,7 @@ export interface BackfillOperationalDependencies {
   transition403(runId: string, details: OperationalTransition): Promise<void>;
   transition429(runId: string, details: OperationalTransition): Promise<void>;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
+  startProviderRun?: (progress: ProgressSupplier) => Promise<{ runId: string; saveProgress(progress: ProgressWriteWithoutVersionTokenProviderState): Promise<void> }>;
 }
 export interface OperationalTransition {
   url: string;
@@ -81,7 +157,7 @@ export class BackfillJerResultsUseCase {
   async execute(options: BackfillOptions = {}): Promise<RunSummary> {
     if (options.from) assertDate(options.from); if (options.to) assertDate(options.to); const runId = await this.repository.startRun('BACKFILL'); const summary = emptySummary();
     try { const requested = options.games?.length ? options.games : undefined; if (requested) { const catalog = await this.repository.listGames(); if (!catalog.length) throw new Error('Cannot validate requested game filters because the persisted JER catalog is empty; run discover first'); const unknown = requested.filter(code => !catalog.some(game => game.code === code)); if (unknown.length) throw new Error(`Unknown requested game code(s): ${unknown.join(', ')}`); }
-      const discovered = await this.source.discover(options.signal); await this.repository.upsertGames(discovered); const games = requested ? discovered.filter(game => requested.includes(game.code)) : discovered; summary.gamesQueried = games.length; for (const game of games) { try { const dates = await this.source.dates(game.detailUrl, options.signal); const existing = new Set(await this.repository.existingDates(game.code, options.from, options.to)); const missing = dates.filter(date => (!options.from || date >= options.from) && (!options.to || date <= options.to) && !existing.has(date)); for (const date of missing) { summary.datesQueried++; try { const result = await this.source.historical(game, date, options.signal); summary.resultsFound++; await recordResult(this.repository, result, summary); } catch (error) { if (options.signal?.aborted) throw error; summary.errors.push(`${game.code} ${date}: ${error instanceof Error ? error.message : String(error)}`); } } } catch (error) { if (options.signal?.aborted) throw error; summary.errors.push(`${game.code}: ${error instanceof Error ? error.message : String(error)}`); } } const status = summary.errors.length ? 'PARTIAL' : 'SUCCESS'; await this.repository.finishRun(runId, summary, status); return { id: runId, status, ...summary }; }
+      const discovered = await this.source.discover(options.signal); await this.repository.upsertGames(discovered); const games = requested ? discovered.filter(game => requested.includes(game.code)) : discovered; summary.gamesQueried = games.length; for (const game of games) { try { const dates = await this.source.dates(game.detailUrl, options.signal); const existing = new Set(await this.repository.existingDates(game.code, options.from, options.to)); const missing = dates.filter(date => (!options.from || date >= options.from) && (!options.to || date <= options.to) && !existing.has(date)); for (const date of missing) { summary.datesQueried++; try { const result = await this.source.historical(game, date, options.signal); if (result) { summary.resultsFound++; await recordResult(this.repository, result, summary); } else summary.resultsSkipped++; } catch (error) { if (options.signal?.aborted) throw error; summary.errors.push(`${game.code} ${date}: ${error instanceof Error ? error.message : String(error)}`); } } } catch (error) { if (options.signal?.aborted) throw error; summary.errors.push(`${game.code}: ${error instanceof Error ? error.message : String(error)}`); } } const status = summary.errors.length ? 'PARTIAL' : 'SUCCESS'; await this.repository.finishRun(runId, summary, status); return { id: runId, status, ...summary }; }
     catch (error) { summary.errors.push(error instanceof Error ? error.message : String(error)); await this.repository.finishRun(runId, summary, 'FAILED'); return { id: runId, status: 'FAILED', ...summary }; }
   }
 
@@ -102,9 +178,18 @@ export class BackfillJerResultsUseCase {
     let heartbeatError: Error | undefined;
     const heartbeat = new RenewableLeaseHeartbeat({ ownerToken: guard.ownerToken, renew: guard.renew, controller, clock: { now: () => Date.now(), sleep: guard.sleep }, leaseDurationMs: guard.leaseDurationMs, renewIntervalMs: guard.renewIntervalMs, onFatal: error => { heartbeatError = error; } });
     const progress: OperationalProgress = { version: 0, requestToken: '', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', priorSnapshot: guard.priorSnapshot, gamesQueried: 0, datesQueried: 0, processedBatches: 0, totalMissing: 0 };
+    const progressWrite = (): ProgressWriteWithoutVersionTokenProviderState => ({ attempted: progress.attempted, inserted: progress.inserted, updated: progress.updated, skipped: progress.skipped, failed: progress.failed, status: progress.status, nextPendingDate: progress.nextPendingDate });
+    let providerSave: ((write: ProgressWriteWithoutVersionTokenProviderState) => Promise<void>) | undefined;
+    let providerWriteFailed = false;
     const save = async (status: IngestionStatus, nextPendingDate?: string) => {
-      progress.version++; progress.requestToken = guard.nextRequestToken(); progress.status = status; progress.nextPendingDate = nextPendingDate;
+      progress.status = status; progress.nextPendingDate = nextPendingDate;
       if (!runId) throw new Error('Operational run was not initialized');
+      if (providerSave) {
+        try { await providerSave(progressWrite()); }
+        catch (error) { providerWriteFailed = true; throw error; }
+        return;
+      }
+      progress.version++; progress.requestToken = guard.nextRequestToken();
       await guard.saveProgress(runId, { ...progress });
     };
     const ensure = async () => {
@@ -119,7 +204,11 @@ export class BackfillJerResultsUseCase {
     };
 
     try {
-      runId = await this.repository.startRun('BACKFILL', guard.ownerToken);
+      if (guard.startProviderRun) {
+        const providerRun = await guard.startProviderRun(progressWrite);
+        runId = providerRun.runId;
+        providerSave = providerRun.saveProgress;
+      } else runId = await this.repository.startRun('BACKFILL', guard.ownerToken);
       await save('RUNNING');
       heartbeat.start();
       const requested = options.games?.length ? options.games : undefined;
@@ -138,7 +227,14 @@ export class BackfillJerResultsUseCase {
       const pending: Array<{ game: DiscoveredGame; date: string }> = [];
       for (const game of selected) {
         await ensure();
-        const dates = await this.source.dates(game.detailUrl, controller.signal);
+        let dates: string[];
+        try { dates = await this.source.dates(game.detailUrl, controller.signal); }
+        catch (error) {
+          if (!(error instanceof JerHtmlStructureChangedError)) throw error;
+          progress.failed++;
+          summary.errors.push(`${game.code}: ${messageOf(error)}`);
+          continue;
+        }
         const existing = new Set(await this.repository.existingDates(game.code, options.from, options.to));
         for (const date of dates.sort()) {
           if ((!options.from || date >= options.from) && (!options.to || date <= options.to) && !existing.has(date)) pending.push({ game, date });
@@ -159,6 +255,7 @@ export class BackfillJerResultsUseCase {
           await save('RUNNING', item.date);
           try {
             const draw = await this.source.historical(item.game, item.date, controller.signal);
+            if (!draw) { progress.skipped++; summary.resultsSkipped++; await save('RUNNING', nextPendingDate); continue; }
             summary.resultsFound++;
             let action: 'inserted' | 'updated' | 'skipped';
             try { action = await this.repository.upsertResult(draw); } catch (error) { throw new FatalBackfillError(messageOf(error)); }
@@ -166,7 +263,23 @@ export class BackfillJerResultsUseCase {
             await save('RUNNING', nextPendingDate);
           } catch (error) {
             if (error instanceof JerBlockedError) {
-              await guard.transition403(runId, { url: error.url, status: 403, gameCode: item.game.code, date: item.date, error: error.message, cooldownMs: guard.blockCooldownMs, nextPendingDate: item.date });
+              let blockedError = error;
+              if (providerSave && (this.source.canRetryScrapedoBlockedRequest?.() ?? true)) {
+                try {
+                  await ensure();
+                  const replacement = await this.source.historical(item.game, item.date, controller.signal);
+                  if (!replacement) { progress.skipped++; summary.resultsSkipped++; await save('RUNNING', nextPendingDate); continue; }
+                  summary.resultsFound++;
+                  const action = await this.repository.upsertResult(replacement);
+                  progress[action]++; summary[`results${action[0].toUpperCase()}${action.slice(1)}` as 'resultsInserted' | 'resultsUpdated' | 'resultsSkipped']++;
+                  await save('RUNNING', nextPendingDate);
+                  continue;
+                } catch (replacementError) {
+                  if (!(replacementError instanceof JerBlockedError)) throw replacementError;
+                  blockedError = replacementError;
+                }
+              }
+              await guard.transition403(runId, { url: blockedError.url, status: 403, gameCode: item.game.code, date: item.date, error: blockedError.message, cooldownMs: guard.blockCooldownMs, nextPendingDate: item.date });
               return { id: runId, status: 'BLOCKED', sourceState: 'BLOCKED', ...summary };
             }
             if (error instanceof JerRateLimitError) {
@@ -174,6 +287,7 @@ export class BackfillJerResultsUseCase {
               await guard.transition429(runId, { url: error.url, status: 429, gameCode: item.game.code, date: item.date, error: error.message, cooldownMs, nextPendingDate: item.date });
               return { id: runId, status: 'PAUSED', sourceState: 'RATE_LIMITED', ...summary };
             }
+            if (error instanceof ScrapedoProviderError) throw error;
             if (isRepositoryFailure(error)) throw error;
             progress.failed++; summary.errors.push(`${item.game.code} ${item.date}: ${messageOf(error)}`);
             await save('RUNNING', nextPendingDate);
@@ -196,7 +310,9 @@ export class BackfillJerResultsUseCase {
       }
       const status: IngestionStatus = options.signal?.aborted ? 'CANCELLED' : 'FAILED';
       summary.errors.push(messageOf(error));
-      try { await save(status, progress.nextPendingDate); } finally { if (runId) await this.repository.finishRun(runId, summary, status); }
+      try { if (!providerWriteFailed) await save(status, progress.nextPendingDate); }
+      catch (saveError) { summary.errors.push(messageOf(saveError)); }
+      finally { if (runId) await this.repository.finishRun(runId, summary, status); }
       return { id: runId ?? '', status, ...summary };
     } finally {
       heartbeat.stop();

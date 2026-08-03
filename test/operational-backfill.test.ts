@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { JerBlockedError, JerRateLimitError, type DiscoveredGame, type NormalizedDrawResult } from '../src/jer/domain.js';
+import { JerBlockedError, JerHtmlStructureChangedError, JerRateLimitError, type DiscoveredGame, type NormalizedDrawResult } from '../src/jer/domain.js';
 import { BackfillJerResultsUseCase, type BackfillOperationalDependencies } from '../src/jer/use-cases.js';
+import { ScrapedoSessionPolicy, type ProviderStateV1, type SessionAttempt, type SessionIdGenerator } from '../src/jer/session-policy.js';
+import { ProviderStateCommitter, ScrapedoProviderError, ScrapedoRuntime, type ProgressWriteWithoutVersionTokenProviderState, type ProviderStateWriter } from '../src/jer/scrapedo-runtime.js';
+import { JerSource } from '../src/jer/use-cases.js';
 
 const games: DiscoveredGame[] = [
   { code: 'A', name: 'A', type: 'CHANCE', detailUrl: 'https://jer.example/a', active: true },
@@ -18,10 +21,10 @@ function fixture(overrides: Partial<BackfillOperationalDependencies> = {}) {
   const source = {
     discover: vi.fn(async () => { calls.push('GET:catalog'); return games; }),
     dates: vi.fn(async (url: string) => { calls.push(`GET:${url}`); return url.endsWith('/a') ? ['2026-07-01', '2026-07-02'] : ['2026-07-03']; }),
-    historical: vi.fn(async (game: DiscoveredGame, date: string) => { calls.push(`POST:${game.code}/${date}`); return result(game, date); }),
+    historical: vi.fn(async (game: DiscoveredGame, date: string): Promise<NormalizedDrawResult | null> => { calls.push(`POST:${game.code}/${date}`); return result(game, date); }),
   };
   const repository = {
-    startRun: vi.fn(async () => 'run-1'), upsertGames: vi.fn(async () => undefined), existingDates: vi.fn(async (_gameCode: string) => [] as string[]),
+    startRun: vi.fn(async () => 'run-1'), startOrResumeScrapedoBackfill: vi.fn(async (): Promise<{ runId: string; providerState: ProviderStateV1 | undefined; version: number; requestToken: string }> => ({ runId: 'scrapedo-run', providerState: undefined, version: 0, requestToken: 'resume-token' })), upsertGames: vi.fn(async () => undefined), existingDates: vi.fn(async (_gameCode: string) => [] as string[]),
     upsertResult: vi.fn(async () => 'inserted' as const), finishRun: vi.fn(async () => undefined),
   };
   const dependencies: BackfillOperationalDependencies = {
@@ -44,6 +47,55 @@ function deferred<T = void>() {
 }
 
 describe('guarded operational backfill', () => {
+  it('binds the Scrape.do runtime after the lease and start/resume receipt before the first request', async () => {
+    const f = fixture();
+    const order: string[] = [];
+    f.dependencies.acquireAndGate = vi.fn(async () => { order.push('lease'); return { acquired: true, state: 'ACTIVE' as const }; });
+    f.dependencies.startProviderRun = vi.fn(async progress => {
+      order.push(`bind:${progress().attempted}:${progress().status}`);
+      return { runId: 'scrapedo-run', saveProgress: vi.fn(async () => { order.push('provider-save'); }) };
+    });
+    f.source.discover.mockImplementation(async () => { order.push('request'); return games; });
+
+    await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(order.indexOf('lease')).toBeLessThan(order.findIndex(entry => entry.startsWith('bind:')));
+    expect(order.findIndex(entry => entry.startsWith('bind:'))).toBeLessThan(order.indexOf('request'));
+  });
+
+  it('uses the provider committer RPC for progress-only saves without pre-incrementing caller-owned versions', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    const saves: Array<{ attempted: number; skipped: number; status: string; nextPendingDate?: string }> = [];
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: vi.fn(async progress => { saves.push(progress); }) }));
+
+    await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(f.dependencies.saveProgress).not.toHaveBeenCalled();
+    expect(saves).toContainEqual(expect.objectContaining({ attempted: 1, status: 'PAUSED' }));
+    expect(saves.every(save => !('version' in save) && !('requestToken' in save) && !('providerState' in save))).toBe(true);
+  });
+
+  it('keeps direct operational runs on the legacy start/save path without provider RPCs', async () => {
+    const f = fixture();
+    await expect(new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational()).resolves.toMatchObject({ status: 'SUCCESS' });
+    expect(f.repository.startRun).toHaveBeenCalledWith('BACKFILL', 'owner-1');
+    expect(f.repository.startOrResumeScrapedoBackfill).not.toHaveBeenCalled();
+    expect(f.dependencies.saveProgress).toHaveBeenCalled();
+  });
+
+
+  it('records a valid no-results historical date as skipped without persisting a result', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    f.source.historical.mockResolvedValueOnce(null);
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'PAUSED', resultsFound: 0, resultsSkipped: 1 });
+    expect(f.source.historical).toHaveBeenCalledTimes(1);
+    expect(f.repository.upsertResult).not.toHaveBeenCalled();
+    expect((f.dependencies.saveProgress as ReturnType<typeof vi.fn>).mock.calls.map(([, progress]) => progress)).toContainEqual(expect.objectContaining({ attempted: 1, skipped: 1 }));
+  });
+
   it.each([
     ['discover', new JerBlockedError('blocked', 403, games[0].detailUrl), 'BLOCKED', 'transition403'],
     ['discover', new JerRateLimitError('limited', 429, games[0].detailUrl), 'PAUSED', 'transition429'],
@@ -138,6 +190,199 @@ describe('guarded operational backfill', () => {
     fatal.repository.upsertResult.mockRejectedValueOnce(new Error('database down'));
     await expect(new BackfillJerResultsUseCase(fatal.source as never, fatal.repository as never, fatal.dependencies).executeOperational()).resolves.toMatchObject({ status: 'FAILED' });
     expect(fatal.calls.filter(call => call.startsWith('POST:'))).toEqual(['POST:A/2026-07-01']);
+  });
+
+  it('records an invalid date page per game and processes valid pending dates from later games', async () => {
+    const f = fixture();
+    f.source.dates.mockRejectedValueOnce(new JerHtmlStructureChangedError('Date selector select[name="fecha"] was not found'));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'PARTIAL', gamesQueried: 2, datesQueried: 1, resultsInserted: 1 });
+    expect(summary.errors).toEqual(['A: Date selector select[name="fecha"] was not found']);
+    expect(f.source.dates).toHaveBeenCalledTimes(2);
+    expect(f.calls.filter(call => call.startsWith('POST:'))).toEqual(['POST:B/2026-07-03']);
+    expect(f.repository.finishRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ errors: summary.errors }), 'PARTIAL');
+    expect((f.dependencies.saveProgress as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toMatchObject({ status: 'PARTIAL', failed: 1 });
+  });
+
+  it('gives a bound Scrape.do runtime one replacement request before transitioning a second target block', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: vi.fn(async () => undefined) }));
+    f.source.historical.mockRejectedValueOnce(new JerBlockedError('first block', 403, games[0].detailUrl)).mockResolvedValueOnce(result(games[0], '2026-07-01'));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'PAUSED', resultsInserted: 1 });
+    expect(f.source.historical).toHaveBeenCalledTimes(2);
+    expect(f.dependencies.transition403).not.toHaveBeenCalled();
+  });
+
+  it('persists pending Super after a threshold block and transitions without promoting during the same logical request', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: vi.fn(async () => undefined) }));
+    const source = f.source as typeof f.source & { canRetryScrapedoBlockedRequest(): boolean };
+    source.canRetryScrapedoBlockedRequest = vi.fn(() => false);
+    source.historical.mockRejectedValueOnce(new JerBlockedError('threshold block', 403, games[0].detailUrl));
+
+    const summary = await new BackfillJerResultsUseCase(source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'BLOCKED', sourceState: 'BLOCKED' });
+    expect(source.canRetryScrapedoBlockedRequest).toHaveBeenCalledTimes(1);
+    expect(source.historical).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.transition403).toHaveBeenCalledWith('scrapedo-run', expect.objectContaining({ error: 'threshold block', date: '2026-07-01' }));
+  });
+
+  it('transitions and stops after the replacement Scrape.do request is also target-blocked', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: vi.fn(async () => undefined) }));
+    f.source.historical
+      .mockRejectedValueOnce(new JerBlockedError('first block', 403, games[0].detailUrl))
+      .mockRejectedValueOnce(new JerBlockedError('second block', 403, games[0].detailUrl));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'BLOCKED', sourceState: 'BLOCKED' });
+    expect(f.source.historical).toHaveBeenCalledTimes(2);
+    expect(f.dependencies.transition403).toHaveBeenCalledWith('scrapedo-run', expect.objectContaining({ error: 'second block', date: '2026-07-01' }));
+  });
+
+  it('persists fresh-null and blocked session states before one distinct replacement, then transitions once without Super', async () => {
+    const f = fixture({ maxResults: 1, batchSize: 1 });
+    const generated = [101, 202];
+    const generator: SessionIdGenerator = { next: excluded => {
+      const value = generated.shift();
+      if (value === undefined || excluded?.has(value)) throw new Error('unexpected generated session');
+      return value;
+    } };
+    const fresh = { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: null, sessionStatus: 'INVALID', standardBlockedSessionCount: 0, pendingSuper: false } as unknown as ProviderStateV1;
+    const providerWrites: Array<Parameters<ProviderStateWriter['save']>[0]> = [];
+    const requests: Array<{ url: string; method: string; headers: Record<string, string>; body: string | undefined; attempt: SessionAttempt }> = [];
+    const committer = new ProviderStateCommitter({ save: vi.fn(async write => {
+      providerWrites.push(write);
+      return { accepted: true, duplicate: false, runId: write.runId, version: write.version, requestToken: write.requestToken, providerState: write.providerState };
+    }) }, { nextRequestToken: (() => { let token = 0; return () => `provider-token-${++token}`; })() });
+    const runtime = new ScrapedoRuntime({ policy: new ScrapedoSessionPolicy({ generator, maxStandardBlockedSessions: 2, superEnabled: true }), committer, retryDelayMs: 0, sleep: vi.fn(async () => undefined) });
+    runtime.bind({ runId: 'scrapedo-run', ownerToken: 'owner-1', committed: { version: 1, requestToken: 'seed-token', providerState: fresh } });
+    const transport = { requestRaw: vi.fn(async (url: string, init: RequestInit, _signal?: AbortSignal) => {
+      if (init.method === 'POST') return { status: 403, headers: new Headers({ 'Scrape.do-Initial-Status-Code': '403', 'Scrape.do-Target-Url': url }), body: '' };
+      return { status: 200, headers: new Headers(), body: 'ok' };
+    }) };
+    const history = { getDates: vi.fn(() => ['2026-07-01', '2026-07-02']), parse: vi.fn(() => result(games[0], '2026-07-01')) };
+    const source = new JerSource({ get: vi.fn(), postForm: vi.fn() } as never, { parseGames: () => [games[0]], parseLatest: () => ({ results: [], rejected: [] }) } as never, history as never, 'https://jer.example/results', {
+      runtime,
+      progress: () => ({ attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING' }),
+      transportFactory: attempt => ({ requestRaw: async (url, init, signal) => {
+        requests.push({ url, method: init.method ?? 'GET', headers: Object.fromEntries(new Headers(init.headers).entries()), body: init.body === undefined ? undefined : String(init.body), attempt });
+        return transport.requestRaw(url, init, signal);
+      } }),
+    });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: async (write: Parameters<typeof runtime.saveProgress>[0]) => { await runtime.saveProgress(write); } }));
+
+    const summary = await new BackfillJerResultsUseCase(source, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'BLOCKED', sourceState: 'BLOCKED' });
+    expect(requests).toEqual([
+      { url: 'https://jer.example/results', method: 'GET', headers: {}, body: undefined, attempt: { sessionId: 101, tier: 'STANDARD', transportOptions: { super: false } } },
+      { url: games[0].detailUrl, method: 'GET', headers: {}, body: undefined, attempt: { sessionId: 101, tier: 'STANDARD', transportOptions: { super: false } } },
+      { url: games[0].detailUrl, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'fecha=2026-07-01', attempt: { sessionId: 101, tier: 'STANDARD', transportOptions: { super: false } } },
+      { url: games[0].detailUrl, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'fecha=2026-07-01', attempt: { sessionId: 202, tier: 'STANDARD', transportOptions: { super: false } } },
+    ]);
+    expect(requests.filter(request => request.method === 'POST')).toEqual([
+      { url: games[0].detailUrl, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'fecha=2026-07-01', attempt: { sessionId: 101, tier: 'STANDARD', transportOptions: { super: false } } },
+      { url: games[0].detailUrl, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'fecha=2026-07-01', attempt: { sessionId: 202, tier: 'STANDARD', transportOptions: { super: false } } },
+    ]);
+    expect(requests.some(request => request.body?.includes('2026-07-02'))).toBe(false);
+    expect(providerWrites).toEqual([
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 2, requestToken: 'provider-token-1', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', nextPendingDate: undefined, providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: null, sessionStatus: 'INVALID', standardBlockedSessionCount: 0, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 3, requestToken: 'provider-token-2', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 101, sessionStatus: 'ACTIVE', standardBlockedSessionCount: 0, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 4, requestToken: 'provider-token-3', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 101, sessionStatus: 'ACTIVE', standardBlockedSessionCount: 0, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 5, requestToken: 'provider-token-4', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', nextPendingDate: '2026-07-01', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 101, sessionStatus: 'ACTIVE', standardBlockedSessionCount: 0, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 6, requestToken: 'provider-token-5', attempted: 1, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', nextPendingDate: '2026-07-01', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 101, sessionStatus: 'ACTIVE', standardBlockedSessionCount: 0, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 7, requestToken: 'provider-token-6', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 101, sessionStatus: 'INVALID', standardBlockedSessionCount: 1, pendingSuper: false } },
+      { runId: 'scrapedo-run', ownerToken: 'owner-1', version: 8, requestToken: 'provider-token-7', attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: 202, sessionStatus: 'INVALID', standardBlockedSessionCount: 2, pendingSuper: true } },
+    ]);
+    expect(f.dependencies.transition403).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.transition403).toHaveBeenCalledWith('scrapedo-run', { url: games[0].detailUrl, status: 403, gameCode: 'A', date: '2026-07-01', error: 'JER target returned HTTP 403', cooldownMs: 21_600_000, nextPendingDate: '2026-07-01' });
+    expect(f.dependencies.transition429).toHaveBeenCalledTimes(0);
+    expect(history.getDates).toHaveBeenCalledTimes(1);
+    expect(history.parse).not.toHaveBeenCalled();
+    expect(f.repository.upsertResult).not.toHaveBeenCalled();
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops the batch after a typed Scrape.do provider failure without source transitions or another request', async () => {
+    const f = fixture();
+    f.source.historical.mockRejectedValueOnce(new ScrapedoProviderError('provider'));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary.status).toBe('FAILED');
+    expect(f.source.historical).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.transition403).not.toHaveBeenCalled();
+    expect(f.dependencies.transition429).not.toHaveBeenCalled();
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts immediately and preserves the committed provider snapshot when provider-state persistence rejects', async () => {
+    const f = fixture();
+    const saveProgress = vi.fn(async () => { throw new Error('provider RPC rejected'); });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress }));
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ id: 'scrapedo-run', status: 'FAILED' });
+    expect(saveProgress).toHaveBeenCalledTimes(1);
+    expect(f.source.discover).not.toHaveBeenCalled();
+    expect(f.source.dates).not.toHaveBeenCalled();
+    expect(f.source.historical).not.toHaveBeenCalled();
+    expect(f.dependencies.transition403).not.toHaveBeenCalled();
+    expect(f.dependencies.transition429).not.toHaveBeenCalled();
+    expect(f.repository.finishRun).toHaveBeenCalledWith('scrapedo-run', expect.any(Object), 'FAILED');
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails operational backfill on a mismatched real committer receipt without mutating its snapshot or issuing provider work', async () => {
+    const f = fixture();
+    const original = { runId: 'scrapedo-run', ownerToken: 'owner-1', committed: { version: 1, requestToken: 'seed-token', providerState: { schemaVersion: 1, provider: 'SCRAPEDO', targetOrigin: 'https://jer.com.co', tier: 'STANDARD', sessionId: null, sessionStatus: 'INVALID', standardBlockedSessionCount: 0, pendingSuper: false } as ProviderStateV1 } };
+    const expectedOriginal = structuredClone(original);
+    const writer = { save: vi.fn(async write => ({ accepted: true, duplicate: false, runId: write.runId, version: write.version, requestToken: 'mismatched-token', providerState: write.providerState })) };
+    const committer = new ProviderStateCommitter(writer, { nextRequestToken: () => 'provider-token-1' });
+    const runtime = new ScrapedoRuntime({ policy: new ScrapedoSessionPolicy({ generator: { next: () => 101 }, maxStandardBlockedSessions: 2, superEnabled: false }), committer, retryDelayMs: 0, sleep: vi.fn(async () => undefined) });
+    runtime.bind(original);
+    const providerTransport = { requestRaw: vi.fn() };
+    const source = new JerSource({ get: vi.fn(), postForm: vi.fn() } as never, { parseGames: () => [games[0]], parseLatest: () => ({ results: [], rejected: [] }) } as never, { getDates: () => ['2026-07-01'], parse: () => result(games[0], '2026-07-01') } as never, 'https://jer.example/results', { runtime, progress: () => ({ attempted: 0, inserted: 0, updated: 0, skipped: 0, failed: 0, status: 'RUNNING' }), transportFactory: () => providerTransport });
+    f.dependencies.startProviderRun = vi.fn(async () => ({ runId: 'scrapedo-run', saveProgress: async (write: ProgressWriteWithoutVersionTokenProviderState) => { await runtime.saveProgress(write); } }));
+
+    const summary = await new BackfillJerResultsUseCase(source, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ id: 'scrapedo-run', status: 'FAILED' });
+    expect(original).toEqual(expectedOriginal);
+    expect(committer.current()).toEqual(expectedOriginal);
+    expect(writer.save).toHaveBeenCalledOnce();
+    expect(providerTransport.requestRaw).not.toHaveBeenCalled();
+    expect(f.dependencies.transition403).not.toHaveBeenCalled();
+    expect(f.dependencies.transition429).not.toHaveBeenCalled();
+    expect(f.repository.finishRun).toHaveBeenCalledWith('scrapedo-run', expect.any(Object), 'FAILED');
+    expect(f.dependencies.release).toHaveBeenCalledOnce();
+  });
+
+  it('makes a caller cancellation terminal rather than partial and issues no later request', async () => {
+    const f = fixture();
+    const controller = new AbortController();
+    f.source.historical.mockImplementationOnce(async () => {
+      controller.abort(new Error('fake SIGINT'));
+      throw controller.signal.reason;
+    });
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational({ signal: controller.signal });
+
+    expect(summary).toMatchObject({ status: 'CANCELLED', resultsInserted: 0 });
+    expect(f.source.historical).toHaveBeenCalledTimes(1);
+    expect(f.dependencies.transition403).not.toHaveBeenCalled();
+    expect(f.dependencies.transition429).not.toHaveBeenCalled();
+    expect(f.repository.finishRun).toHaveBeenCalledWith('run-1', expect.any(Object), 'CANCELLED');
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
   });
 
   it('recomputes ascending missing dates from the current repository rather than a prior next-pending hint', async () => {

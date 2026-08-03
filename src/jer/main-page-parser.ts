@@ -26,7 +26,9 @@ export class JerMainPageParser {
 
   parseLatest(html: string, games: DiscoveredGame[], fetchedAt = new Date()): LatestParse {
     const $ = cheerio.load(html); const byUrl = new Map(games.map(game => [game.detailUrl, game])); const results: NormalizedDrawResult[] = []; const rejected: RejectedRow[] = [];
-    $('table.tablaresultados').each((tableIndex, table) => {
+    const tables = $('table.tablaresultados');
+    if (!tables.length) throw new JerHtmlStructureChangedError('Latest result tables were not found');
+    tables.each((tableIndex, table) => {
       const hasThead = $(table).find('thead tr').first().length > 0; const tableRows = hasThead ? $(table).find('tbody tr').toArray() : $(table).find('tr').toArray(); const headerRow = hasThead ? $(table).find('thead tr').first() : $(tableRows.shift() ?? table);
       const headers = headerRow.find('th, td').map((_, cell) => normalizeText($(cell).text()).toLowerCase()).get();
       $(tableRows).each((rowIndex, row) => {
@@ -45,6 +47,7 @@ export class JerMainPageParser {
         } catch (error) { rejected.push({ row: tableIndex * 10000 + rowIndex + 1, reason: error instanceof Error ? error.message : String(error) }); }
       });
     });
+    if (!results.length) throw new JerHtmlStructureChangedError('Latest result tables contained no validated rows');
     return { results, rejected };
   }
 }

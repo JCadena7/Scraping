@@ -7,6 +7,7 @@
     "scrape:jer:latest": "tsx src/jer/cli.ts latest",
     "scrape:jer:discover": "tsx src/jer/cli.ts discover",
     "scrape:jer:backfill": "tsx src/jer/cli.ts backfill",
+    "db:backup": "tsx src/db/backup-cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "tsc -p tsconfig.json",

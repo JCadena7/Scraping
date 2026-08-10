@@ -97,6 +97,28 @@ Official references: [Scrape.do API Mode and parameters](https://scrape.do/docum
 
 ## CLI behavior
 
+### Portable PostgreSQL backup
+
+The database backup has a separate CLI boundary and does not initialize the scraper, Supabase API client, provider, or JER configuration. It backs up the project-owned `public` schema found in this repository's migrations, including its tables and data, sequences, constraints, indexes, functions, triggers, views, and materialized views. Supabase-managed schemas and cluster roles are not included.
+
+Install PostgreSQL client tools so `pg_dump` and `pg_restore` are on `PATH`, then provide either `DATABASE_URL` or the libpq variables `PGHOST`, `PGDATABASE`, and `PGUSER` (plus `PGPASSWORD` or `.pgpass` when required). Connection values are passed to `pg_dump` through its environment, never command-line arguments.
+
+```bash
+# Creates backups/scraper-postgres-YYYYMMDD-HHmmss.dump
+pnpm db:backup
+
+# A custom output must retain the .dump extension.
+pnpm db:backup --output ./backups/before-import.dump
+```
+
+The `.dump` file is a PostgreSQL custom-format archive (`pg_dump -Fc`), not SQL text. The command writes a temporary archive, rejects empty output and existing destinations, then publishes the completed file atomically. Restore into an empty database with a compatible PostgreSQL version:
+
+```bash
+PGDATABASE=target_database pg_restore --exit-on-error --no-owner --no-privileges ./backups/before-import.dump
+```
+
+Set the remaining target libpq variables (`PGHOST`, `PGPORT`, `PGUSER`, and authentication) as needed. Keep `--no-owner` and `--no-privileges` on restore: PostgreSQL archive restores apply those portability choices at `pg_restore` time. A dump can restore to a newer PostgreSQL major version, but restoring to an older major version is not guaranteed. Extensions or features referenced by application objects must exist on the target server.
+
 | Exit code | Status | Meaning |
 |---|---|---|
 | `0` | `SUCCESS` | All requested work completed. |

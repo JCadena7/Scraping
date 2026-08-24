@@ -10,6 +10,9 @@ const verificationMessages = new Set([
   'espere mientras se verifica su solicitud',
   'verificando su solicitud',
 ]);
+const verificationTitles = new Set([
+  'one moment, please...',
+]);
 
 export function normalizeVisibleText(html: string): string {
   const $ = cheerio.load(html);
@@ -19,7 +22,9 @@ export function normalizeVisibleText(html: string): string {
 }
 
 export function isVerificationPage(html: string): boolean {
-  return verificationMessages.has(normalizeVisibleText(html));
+  const $ = cheerio.load(html);
+  const title = $('title').first().text().replace(/\s+/g, ' ').trim().toLowerCase();
+  return verificationMessages.has(normalizeVisibleText(html)) || verificationTitles.has(title);
 }
 
 export function classifyProviderResponse(status: number, headers: Headers, targetUrl: string): ProviderResponseClassification {

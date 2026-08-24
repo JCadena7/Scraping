@@ -13,6 +13,7 @@ describe('JER response classification', () => {
     ['<main>Espere&nbsp;mientras\nse verifica\t su solicitud</main>', 'espere mientras se verifica su solicitud'],
     ['<p>Verificándo <br> su solicitud</p>', 'verificando su solicitud'],
     ['<span>Verificando</span><span>su solicitud</span>', 'verificando su solicitud'],
+    ['<html><head><title>One moment, please...</title></head><body><main>Checking your browser</main></body></html>', 'checking your browser'],
   ])('recognizes only normalized user-observed verification text', (html, normalized) => {
     expect(normalizeVisibleText(html)).toBe(normalized);
     expect(isVerificationPage(html)).toBe(true);

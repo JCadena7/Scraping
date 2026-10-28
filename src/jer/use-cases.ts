@@ -103,7 +103,7 @@ export class SyncJerLatestResultsUseCase {
   }
 }
 
-export interface BackfillOptions { games?: string[]; from?: string; to?: string; signal?: AbortSignal; }
+export interface BackfillOptions { games?: string[]; from?: string; to?: string; untilDone?: boolean; signal?: AbortSignal; }
 export interface OperationalProgress {
   version: number;
   requestToken: string;
@@ -140,8 +140,10 @@ export interface BackfillOperationalDependencies {
   transition403(runId: string, details: OperationalTransition): Promise<void>;
   transition429(runId: string, details: OperationalTransition): Promise<void>;
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
+  onCheckpoint?: (checkpoint: BackfillCheckpoint) => void;
   startProviderRun?: (progress: ProgressSupplier) => Promise<{ runId: string; saveProgress(progress: ProgressWriteWithoutVersionTokenProviderState): Promise<void> }>;
 }
+export interface BackfillCheckpoint { attempted: number; inserted: number; updated: number; skipped: number; failed: number; processedBatches: number; remaining: number; totalMissing: number; }
 export interface OperationalTransition {
   url: string;
   status: 403 | 429;
@@ -243,15 +245,29 @@ export class BackfillJerResultsUseCase {
       progress.totalMissing = pending.length;
       await save('RUNNING', pending[0]?.date);
 
+      const untilDone = options.untilDone === true;
       let cursor = 0;
       let batches = 0;
-      while (cursor < pending.length && progress.attempted < guard.maxResults && batches < guard.maxBatches) {
-        const batchEnd = Math.min(cursor + guard.batchSize, pending.length, cursor + (guard.maxResults - progress.attempted));
+      let chunkAttempted = 0;
+      let chunkBatches = 0;
+      const chunkExhausted = () => untilDone
+        ? chunkAttempted >= guard.maxResults || chunkBatches >= guard.maxBatches
+        : progress.attempted >= guard.maxResults || batches >= guard.maxBatches;
+      while (cursor < pending.length) {
+        if (chunkExhausted()) {
+          if (!untilDone) break;
+          guard.onCheckpoint?.({ attempted: progress.attempted, inserted: progress.inserted, updated: progress.updated, skipped: progress.skipped, failed: progress.failed, processedBatches: batches, remaining: pending.length - cursor, totalMissing: pending.length });
+          await guard.sleep(guard.batchPauseMs, controller.signal);
+          chunkAttempted = 0;
+          chunkBatches = 0;
+        }
+        const remaining = untilDone ? guard.maxResults - chunkAttempted : guard.maxResults - progress.attempted;
+        const batchEnd = Math.min(cursor + guard.batchSize, pending.length, cursor + remaining);
         for (; cursor < batchEnd; cursor++) {
           const item = pending[cursor];
           const nextPendingDate = pending[cursor + 1]?.date;
           await ensure();
-          progress.attempted++; progress.datesQueried++; summary.datesQueried++;
+          progress.attempted++; chunkAttempted++; progress.datesQueried++; summary.datesQueried++;
           await save('RUNNING', item.date);
           try {
             const draw = await this.source.historical(item.game, item.date, controller.signal);
@@ -293,8 +309,8 @@ export class BackfillJerResultsUseCase {
             await save('RUNNING', nextPendingDate);
           }
         }
-        batches++; progress.processedBatches = batches;
-        if (cursor < pending.length && progress.attempted < guard.maxResults && batches < guard.maxBatches) await guard.sleep(guard.batchPauseMs, controller.signal);
+        batches++; chunkBatches++; progress.processedBatches = batches;
+        if (cursor < pending.length && !chunkExhausted()) await guard.sleep(guard.batchPauseMs, controller.signal);
       }
       const status: IngestionStatus = cursor < pending.length ? 'PAUSED' : summary.errors.length ? 'PARTIAL' : 'SUCCESS';
       await save(status, pending[cursor]?.date);

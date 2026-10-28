@@ -13,9 +13,16 @@ import { ProviderStateCommitter, ScrapedoRuntime } from './scrapedo-runtime.js';
 import { ScrapedoSessionPolicy, SecureSessionIdGenerator } from './session-policy.js';
 
 const operationalOverrideNames = new Set(['batch-size', 'max-batches', 'max-results', 'max-batches-per-run', 'max-results-per-run', 'request-delay-ms', 'batch-pause-ms', 'concurrency', 'max-retries', 'block-cooldown-ms', 'rate-limit-cooldown-ms', 'lease-duration-ms', 'lease-renew-interval-ms']);
-const backfillFilterNames = new Set(['game', 'games', 'from', 'to']);
-export interface CliDependencies { discover: (signal?: AbortSignal) => Promise<unknown>; latest: (signal?: AbortSignal) => Promise<{ status: string; sourceState?: string }>; backfill: (options: { games?: string[]; from?: string; to?: string; signal?: AbortSignal }) => Promise<{ status: string; sourceState?: string }>; print: (value: unknown) => void; error: (value: string) => void; }
+const backfillNonOperationalArgs = new Set(['game', 'games', 'from', 'to', 'until-done']);
+export interface CliDependencies { discover: (signal?: AbortSignal) => Promise<unknown>; latest: (signal?: AbortSignal) => Promise<{ status: string; sourceState?: string }>; backfill: (options: { games?: string[]; from?: string; to?: string; untilDone?: boolean; signal?: AbortSignal }) => Promise<{ status: string; sourceState?: string }>; print: (value: unknown) => void; error: (value: string) => void; }
 export function parseArgs(values: string[]): Record<string, string> { return Object.fromEntries(values.filter(value => value.startsWith('--')).map(value => { const [key, ...rest] = value.slice(2).split('='); return [key, rest.join('=')]; })); }
+export function parseBooleanFlag(args: Record<string, string>, name: string): boolean {
+  if (!(name in args)) return false;
+  const value = args[name];
+  if (value === '' || value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`--${name} expects true or false`);
+}
 export function assertScrapedoCommandAllowed(command: string | undefined, provider: Pick<JerConfig['provider'], 'kind'>): void {
   if (provider.kind === 'SCRAPEDO' && command !== 'backfill') throw new Error('Scrape.do is available only for backfill');
 }
@@ -38,11 +45,12 @@ export function parseOperationalOverrides(values: Record<string, string>): JerOp
 }
 export async function runCli(argv: string[], dependencies: CliDependencies, signal?: AbortSignal): Promise<number> {
   const [command, ...values] = argv; const args = parseArgs(values); const games = args.games ? args.games.split(',').map(value => value.trim()).filter(Boolean) : args.game ? [args.game] : undefined;
-  if (command === 'backfill') parseOperationalOverrides(Object.fromEntries(Object.entries(args).filter(([key]) => !backfillFilterNames.has(key))));
+  if ('until-done' in args && command !== 'backfill') { dependencies.error('--until-done is only supported for backfill'); return 1; }
+  if (command === 'backfill') parseOperationalOverrides(Object.fromEntries(Object.entries(args).filter(([key]) => !backfillNonOperationalArgs.has(key))));
   if (command === 'discover') { const result = await dependencies.discover(signal); dependencies.print(result); return signal?.aborted ? 130 : isCommandSummary(result) ? exitCode(result) : 0; }
   if (command === 'latest') return exitCode(await dependencies.latest(signal));
-  if (command === 'backfill') return exitCode(await dependencies.backfill({ games, from: args.from, to: args.to, signal }));
-  dependencies.error('Usage: pnpm scrape:jer:{discover|latest|backfill} [--game=CODE] [--games=A,B] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD]'); return 1;
+  if (command === 'backfill') return exitCode(await dependencies.backfill({ games, from: args.from, to: args.to, untilDone: parseBooleanFlag(args, 'until-done'), signal }));
+  dependencies.error('Usage: pnpm scrape:jer:{discover|latest|backfill} [--game=CODE] [--games=A,B] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD] [--until-done]'); return 1;
 }
 function exitCode(summary: { status: string; sourceState?: string }): number { if (summary.sourceState === 'RATE_LIMITED') return 4; if (summary.status === 'PAUSED') return 0; return summary.status === 'SUCCESS' ? 0 : summary.status === 'PARTIAL' ? 2 : summary.status === 'BLOCKED' ? 3 : summary.status === 'CANCELLED' ? 130 : 1; }
 function isCommandSummary(value: unknown): value is { status: string; sourceState?: string } { return typeof value === 'object' && value !== null && 'status' in value && typeof value.status === 'string'; }
@@ -65,7 +73,7 @@ export interface MainOptions {
 
 export async function main(options: MainOptions = {}): Promise<number> {
   const argv = options.argv ?? process.argv.slice(2); const args = parseArgs(argv.slice(1));
-  const operationalArgs = argv[0] === 'backfill' ? Object.fromEntries(Object.entries(args).filter(([key]) => !backfillFilterNames.has(key))) : {};
+  const operationalArgs = argv[0] === 'backfill' ? Object.fromEntries(Object.entries(args).filter(([key]) => !backfillNonOperationalArgs.has(key))) : {};
   const config = loadConfig(options.env ?? process.env, parseOperationalOverrides(operationalArgs));
   assertScrapedoCommandAllowed(argv[0], config.provider);
   if (!config.enabled) { console.error('JER scraper is disabled (JER_SCRAPER_ENABLED=false).'); return 1; }
@@ -100,7 +108,8 @@ export function createOperationalDependencies(repository: DrawRepository, config
       source.bindScrapedo({ runtime, progress, transportFactory: attempt => new ScrapedoHttpClient({ endpoint: scrapedoProvider.endpoint, token: scrapedoProvider.token, timeoutMs: config.timeoutMs, userAgent: config.userAgent, sessionId: attempt.sessionId, super: attempt.transportOptions.super, logger }), logger });
       return { runId: resumed.runId, saveProgress: async write => { await runtime.saveProgress(write); } };
     } : undefined,
-    transition403: async (runId: string, details: OperationalTransition) => { await repository.transitionJer403(ownerToken, runId, details.cooldownMs, details.error); }, transition429: async (runId: string, details: OperationalTransition) => { await repository.transitionJer429(ownerToken, runId, details.cooldownMs, details.error); }, sleep: sleepWithAbort };
+    transition403: async (runId: string, details: OperationalTransition) => { await repository.transitionJer403(ownerToken, runId, details.cooldownMs, details.error); }, transition429: async (runId: string, details: OperationalTransition) => { await repository.transitionJer429(ownerToken, runId, details.cooldownMs, details.error); },
+    onCheckpoint: checkpoint => { console.error(JSON.stringify({ event: 'backfill.checkpoint', ...checkpoint })); }, sleep: sleepWithAbort };
 }
 
 async function withJerLease<T>(repository: DrawRepository, config: ReturnType<typeof loadConfig>, signal: AbortSignal | undefined, operation: (signal: AbortSignal, ownerToken: string) => Promise<T>): Promise<T | { status: string; sourceState?: string }> {

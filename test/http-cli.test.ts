@@ -225,6 +225,26 @@ describe('CLI filters and status', () => {
     expect(readme).not.toContain('filter, cancellation, or complete failure');
   });
 
+  it('parses and forwards --until-done only for backfill', async () => {
+    const dependencies = { latest: vi.fn(), backfill: vi.fn(async () => ({ status: 'SUCCESS' })), discover: vi.fn(), print: vi.fn(), error: vi.fn() };
+
+    await expect(runCli(['backfill', '--from=2026-07-24', '--to=2026-10-27', '--until-done'], dependencies)).resolves.toBe(0);
+    expect(dependencies.backfill).toHaveBeenLastCalledWith({ games: undefined, from: '2026-07-24', to: '2026-10-27', untilDone: true, signal: undefined });
+
+    await expect(runCli(['backfill', '--until-done=false'], dependencies)).resolves.toBe(0);
+    expect(dependencies.backfill).toHaveBeenLastCalledWith(expect.objectContaining({ untilDone: false }));
+
+    await expect(runCli(['latest', '--until-done'], dependencies)).resolves.toBe(1);
+    expect(dependencies.latest).not.toHaveBeenCalled();
+    expect(dependencies.error).toHaveBeenCalledWith('--until-done is only supported for backfill');
+  });
+
+  it('rejects malformed --until-done values', async () => {
+    const dependencies = { latest: vi.fn(), backfill: vi.fn(), discover: vi.fn(), print: vi.fn(), error: vi.fn() };
+    await expect(runCli(['backfill', '--until-done=yes'], dependencies)).rejects.toThrow('--until-done expects true or false');
+    expect(dependencies.backfill).not.toHaveBeenCalled();
+  });
+
   it('parses actual discovered game codes without losing comma-separated filters', () => {
     expect(parseArgs(['--game=CHONTICO_DIA', '--games=CHONTICO_DIA,CHONTICO_NOCHE', '--from=2026-07-01'])).toEqual({
       game: 'CHONTICO_DIA', games: 'CHONTICO_DIA,CHONTICO_NOCHE', from: '2026-07-01',

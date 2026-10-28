@@ -150,6 +150,12 @@ The long aliases `--max-batches-per-run` and `--max-results-per-run` remain supp
 
 Backfill is sequential: `attempted results = min(authoritative missing dates, max results)` across all selected games. A batch has at most `batch-size` attempts; another starts only while both limits remain. The batch pause occurs only between eligible batches. Existing stored dates are authoritative on resume; `nextPendingDate` is telemetry only.
 
+By default, reaching `max-results` or `max-batches` ends the invocation with `PAUSED` (exit `0`). Add `--until-done` to keep one process working through the remaining window: the catalog and each game's available dates are read once, the chunk budgets reset after a checkpoint pause, and the run continues until every missing date is processed or the source becomes blocked, rate-limited, or cancelled. Checkpoints are written to stderr as JSON (`event: "backfill.checkpoint"`) without polluting the final summary on stdout.
+
+```bash
+pnpm scrape:jer:backfill --from=2026-07-24 --to=2026-10-27 --until-done
+```
+
 403 stores a six-hour default blocked cooldown; exhausted 429 stores `max(valid Retry-After, configured rate-limit cooldown)`. Both stop later requests. No proxy, CAPTCHA solver, stealth behavior, fingerprint manipulation, or parallelization is used. SIGINT/SIGTERM abort fetches, sleeps, and heartbeats through one controller; backfill records `CANCELLED`, preserves earlier immediate saves, releases its owner lease once, and exits 130.
 
 Apply `202607240003_jer_operational_guards.sql` after the prior draw and hardening migrations, before deploying this CLI. It adds persistent source state, leases, progress, and service-role-only RPCs. Rollback is operational: stop commands and deploy the previous application; retain the additive migration and its audit state rather than deleting production history.

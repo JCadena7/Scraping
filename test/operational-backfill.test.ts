@@ -133,6 +133,36 @@ describe('guarded operational backfill', () => {
     expect((finalBatch.dependencies.sleep as ReturnType<typeof vi.fn>).mock.calls.filter(([ms]) => ms === finalBatch.dependencies.batchPauseMs)).toHaveLength(0);
   });
 
+  it('continues across result and batch budgets when untilDone is set without re-planning the window', async () => {
+    const checkpoints: Array<{ attempted: number; remaining: number; processedBatches: number }> = [];
+    const f = fixture({ maxResults: 1, batchSize: 1, maxBatches: 1, onCheckpoint: checkpoint => { checkpoints.push(checkpoint); } });
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational({ untilDone: true });
+
+    expect(summary).toMatchObject({ status: 'SUCCESS', gamesQueried: 2, datesQueried: 3, resultsInserted: 3 });
+    expect(f.source.discover).toHaveBeenCalledTimes(1);
+    expect(f.source.dates).toHaveBeenCalledTimes(2);
+    expect(f.calls.filter(call => call.startsWith('POST:'))).toEqual(['POST:A/2026-07-01', 'POST:A/2026-07-02', 'POST:B/2026-07-03']);
+    expect(checkpoints).toEqual([
+      { attempted: 1, inserted: 1, updated: 0, skipped: 0, failed: 0, processedBatches: 1, remaining: 2, totalMissing: 3 },
+      { attempted: 2, inserted: 2, updated: 0, skipped: 0, failed: 0, processedBatches: 2, remaining: 1, totalMissing: 3 },
+    ]);
+    expect((f.dependencies.sleep as ReturnType<typeof vi.fn>).mock.calls.filter(([ms]) => ms === f.dependencies.batchPauseMs)).toHaveLength(2);
+    expect(f.repository.finishRun).toHaveBeenCalledWith('run-1', expect.any(Object), 'SUCCESS');
+    expect(f.dependencies.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the single-chunk PAUSED boundary when untilDone is not set', async () => {
+    const onCheckpoint = vi.fn();
+    const f = fixture({ maxResults: 1, batchSize: 1, maxBatches: 1, onCheckpoint });
+
+    const summary = await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
+
+    expect(summary).toMatchObject({ status: 'PAUSED', datesQueried: 1 });
+    expect(onCheckpoint).not.toHaveBeenCalled();
+    expect(f.source.discover).toHaveBeenCalledTimes(1);
+  });
+
   it('acquires and gates before network, gates every GET and POST, renews, then releases exactly once', async () => {
     const f = fixture();
     await new BackfillJerResultsUseCase(f.source as never, f.repository as never, f.dependencies).executeOperational();
